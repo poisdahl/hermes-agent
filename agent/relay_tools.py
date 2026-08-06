@@ -7,6 +7,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import threading
 import time
 from collections.abc import Callable
@@ -93,11 +94,14 @@ class _SequentialRelayInvocation:
         self,
         timeout_s: float,
         interrupted: Callable[[], bool] | None = None,
+        human_wait_seconds: Callable[[], float] | None = None,
     ) -> None:
         self.timeout_s = float(timeout_s)
         self._interrupted = interrupted
+        self._human_wait_seconds = human_wait_seconds
         self._condition = threading.Condition()
         self._deadline: float | None = None
+        self._human_wait_baseline: float | None = None
         self._armed = False
         self._effect_started = False
         self._abandoned = False
@@ -144,7 +148,40 @@ class _SequentialRelayInvocation:
             if self._armed:
                 raise RuntimeError("sequential Relay invocation reused")
             self._armed = True
+            self._human_wait_baseline = self._read_human_wait_seconds_locked()
             self._deadline = time.monotonic() + self.timeout_s
+
+    def _read_human_wait_seconds_locked(self) -> float | None:
+        """Read a trustworthy cumulative human-wait counter, if available."""
+        if self._human_wait_seconds is None:
+            return None
+        try:
+            value = float(self._human_wait_seconds())
+        except Exception:
+            logger.debug(
+                "sequential Relay human-wait reader failed",
+                exc_info=True,
+            )
+            return None
+        if not math.isfinite(value) or value < 0:
+            logger.debug(
+                "sequential Relay human-wait reader returned invalid value %r",
+                value,
+            )
+            return None
+        return value
+
+    def _effective_deadline_locked(self) -> float | None:
+        """Extend the raw deadline only by human wait accrued since arming."""
+        if self._deadline is None:
+            return None
+        baseline = self._human_wait_baseline
+        if baseline is None:
+            return self._deadline
+        current = self._read_human_wait_seconds_locked()
+        if current is None:
+            return self._deadline
+        return self._deadline + max(0.0, current - baseline)
 
     def _interrupted_locked(self) -> bool:
         if self._interrupted is None:
@@ -174,13 +211,15 @@ class _SequentialRelayInvocation:
             raise self._timeout_locked()
         if self._interrupted_locked():
             raise self._timeout_locked(reason="interrupt")
-        if self._deadline is not None and time.monotonic() >= self._deadline:
+        deadline = self._effective_deadline_locked()
+        if deadline is not None and time.monotonic() >= deadline:
             raise self._timeout_locked(reason="deadline")
 
     def _remaining_locked(self) -> float:
-        if self._deadline is None:
+        deadline = self._effective_deadline_locked()
+        if deadline is None:
             return 0.0
-        return max(0.0, self._deadline - time.monotonic())
+        return max(0.0, deadline - time.monotonic())
 
     def _request_callback(self, args: Any) -> Any:
         """Relay-worker endpoint: publish one callback request and wait."""
@@ -379,7 +418,7 @@ class _SequentialRelayInvocation:
                                 self._request_consumed = True
                         elif not self._worker_done:
                             # A response has been published; only Relay suffix
-                            # work remains, still bounded by the original deadline.
+                            # work remains, still bounded by the effective deadline.
                             if self._interrupted_locked():
                                 timeout = self._timeout_locked(reason="interrupt")
                             elif self._remaining_locked() <= 0:

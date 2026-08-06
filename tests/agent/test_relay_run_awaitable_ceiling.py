@@ -63,10 +63,12 @@ def _controller(
     timeout_s: float,
     *,
     interrupted: Callable[[], bool] | None = None,
+    human_wait_seconds: Callable[[], float] | None = None,
 ):
     return relay_tools._SequentialRelayInvocation(
         timeout_s,
         interrupted=interrupted,
+        human_wait_seconds=human_wait_seconds,
     )
 
 
@@ -358,6 +360,96 @@ def test_effect_claim_is_atomic_with_deadline_expiry():
 
     assert not worker.is_alive()
     assert result == [None]
+
+
+def test_human_wait_delta_extends_final_effect_gate(monkeypatch):
+    now = 10.0
+    human_wait = 7.0
+    execution = _controller(1.0, human_wait_seconds=lambda: human_wait)
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: now)
+    execution._arm()
+
+    now = 12.0
+    human_wait = 8.5
+    execution.try_begin_effect()
+
+    assert execution.effect_disposition == "unknown"
+
+
+def test_prior_human_wait_does_not_extend_final_effect_gate(monkeypatch):
+    now = 10.0
+    human_wait = 7.0
+    execution = _controller(1.0, human_wait_seconds=lambda: human_wait)
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: now)
+    execution._arm()
+
+    now = 12.0
+    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
+        execution.try_begin_effect()
+
+    assert caught.value.reason == "deadline"
+    assert caught.value.effect_disposition == "none"
+
+
+def test_interrupt_wins_over_human_wait_extension(monkeypatch):
+    now = 10.0
+    human_wait = 0.0
+    interrupted = False
+    execution = _controller(
+        1.0,
+        interrupted=lambda: interrupted,
+        human_wait_seconds=lambda: human_wait,
+    )
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: now)
+    execution._arm()
+
+    now = 12.0
+    human_wait = 2.0
+    interrupted = True
+    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
+        execution.try_begin_effect()
+
+    assert caught.value.reason == "interrupt"
+    assert caught.value.effect_disposition == "none"
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), -1.0])
+def test_invalid_human_wait_value_does_not_extend_deadline(monkeypatch, invalid):
+    now = 10.0
+    human_wait = 0.0
+    execution = _controller(1.0, human_wait_seconds=lambda: human_wait)
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: now)
+    execution._arm()
+
+    now = 12.0
+    human_wait = invalid
+    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
+        execution.try_begin_effect()
+
+    assert caught.value.reason == "deadline"
+    assert caught.value.effect_disposition == "none"
+
+
+def test_human_wait_reader_failure_does_not_extend_deadline(monkeypatch):
+    now = 10.0
+    fail = False
+
+    def _human_wait_seconds():
+        if fail:
+            raise RuntimeError("counter unavailable")
+        return 0.0
+
+    execution = _controller(1.0, human_wait_seconds=_human_wait_seconds)
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: now)
+    execution._arm()
+
+    now = 12.0
+    fail = True
+    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
+        execution.try_begin_effect()
+
+    assert caught.value.reason == "deadline"
+    assert caught.value.effect_disposition == "none"
 
 
 def test_final_effect_gate_rejects_after_slow_preflight(monkeypatch):

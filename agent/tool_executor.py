@@ -411,6 +411,30 @@ def _managed_values(
     )
 
 
+def _sequential_human_wait_seconds_reader():
+    """Bind the optional human-wait counter to this approval session.
+
+    Older PR heads do not expose the counter. In that case the sequential
+    controller keeps its original wall-clock bound; after #80297 is present,
+    only source-marked time spent waiting for this session's human approval is
+    excluded.
+    """
+    try:
+        from tools.approval import get_current_session_key, human_wait_seconds
+
+        session_key = get_current_session_key()
+    except ImportError:
+        return None
+    except Exception:
+        logger.debug(
+            "sequential Relay could not bind human-wait accounting",
+            exc_info=True,
+        )
+        return None
+
+    return lambda: human_wait_seconds(session_key)
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -446,6 +470,7 @@ def _run_agent_tool_execution_middleware(
         relay_tools._SequentialRelayInvocation(
             sequential_timeout_s,
             interrupted=lambda: bool(getattr(agent, "_interrupt_requested", False)),
+            human_wait_seconds=_sequential_human_wait_seconds_reader(),
         )
         if sequential_timeout_s is not None
         else None

@@ -423,6 +423,137 @@ def test_final_effect_gate_runs_after_slow_tool_preflight():
     assert effects == []
 
 
+def test_human_approval_wait_crossing_raw_deadline_dispatches_once(monkeypatch):
+    from agent import tool_executor
+
+    try:
+        from tools import approval as approval_module
+        from tools.approval import (
+            human_wait_window,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+    except ImportError:
+        pytest.skip("human-wait accounting requires upstream PR #80297")
+
+    agent = _build_agent("write_file", config={})
+    session_key = f"sequential-human-wait-{uuid.uuid4()}"
+    effects: list[dict] = []
+    approval_called = threading.Event()
+    now = [10.0]
+    clock = SimpleNamespace(monotonic=lambda: now[0])
+    monkeypatch.setattr(relay_tools, "time", clock)
+    monkeypatch.setattr(approval_module, "time", clock)
+
+    def _human_approval(*_args, **_kwargs):
+        approval_called.set()
+        with human_wait_window(session_key):
+            now[0] = 12.0
+        return None
+
+    def _relay_execute(_name, args, callback, **kwargs):
+        execution = kwargs["sequential_execution"]
+
+        async def _request_callback():
+            return execution._request_callback(dict(args))
+
+        return execution.run(_request_callback(), callback), dict(args)
+
+    token = set_current_session_key(session_key)
+    try:
+        with (
+            patch("agent.relay_tools.execute", side_effect=_relay_execute),
+            patch.object(tool_executor, "_begin_tool_execution"),
+            patch(
+                "hermes_cli.plugins.resolve_pre_tool_block",
+                side_effect=_human_approval,
+            ),
+        ):
+            outcome = tool_executor._run_agent_tool_execution_middleware(
+                agent,
+                function_name="write_file",
+                function_args={"path": "result.txt", "content": "value"},
+                effective_task_id="task-1",
+                tool_call_id="call-human-wait",
+                execute=lambda args: effects.append(args) or "ok",
+                sequential_timeout_s=1.0,
+            )
+    finally:
+        reset_current_session_key(token)
+
+    assert outcome.timed_out is False
+    assert outcome.dispatched is True
+    assert outcome.result == "ok"
+    assert effects == [{"path": "result.txt", "content": "value"}]
+    assert approval_called.is_set()
+
+
+def test_other_session_human_wait_does_not_extend_deadline(monkeypatch):
+    from agent import tool_executor
+
+    try:
+        from tools import approval as approval_module
+        from tools.approval import (
+            human_wait_window,
+            reset_current_session_key,
+            set_current_session_key,
+        )
+    except ImportError:
+        pytest.skip("human-wait accounting requires upstream PR #80297")
+
+    agent = _build_agent("write_file", config={})
+    session_key = f"sequential-session-{uuid.uuid4()}"
+    other_session_key = f"sequential-other-session-{uuid.uuid4()}"
+    effects: list[dict] = []
+    approval_called = threading.Event()
+    now = [10.0]
+    clock = SimpleNamespace(monotonic=lambda: now[0])
+    monkeypatch.setattr(relay_tools, "time", clock)
+    monkeypatch.setattr(approval_module, "time", clock)
+
+    def _other_session_wait(*_args, **_kwargs):
+        approval_called.set()
+        with human_wait_window(other_session_key):
+            now[0] = 12.0
+        return None
+
+    def _relay_execute(_name, args, callback, **kwargs):
+        execution = kwargs["sequential_execution"]
+
+        async def _request_callback():
+            return execution._request_callback(dict(args))
+
+        return execution.run(_request_callback(), callback), dict(args)
+
+    token = set_current_session_key(session_key)
+    try:
+        with (
+            patch("agent.relay_tools.execute", side_effect=_relay_execute),
+            patch.object(tool_executor, "_begin_tool_execution"),
+            patch(
+                "hermes_cli.plugins.resolve_pre_tool_block",
+                side_effect=_other_session_wait,
+            ),
+        ):
+            outcome = tool_executor._run_agent_tool_execution_middleware(
+                agent,
+                function_name="write_file",
+                function_args={"path": "result.txt", "content": "value"},
+                effective_task_id="task-1",
+                tool_call_id="call-other-session-wait",
+                execute=lambda args: effects.append(args) or "unexpected",
+                sequential_timeout_s=1.0,
+            )
+    finally:
+        reset_current_session_key(token)
+
+    assert outcome.timed_out is True
+    assert outcome.dispatched is False
+    assert outcome.effect_disposition == "none"
+    assert effects == []
+    assert approval_called.is_set()
+
+
 def test_claimed_effect_exception_is_unknown_and_next_call_runs(monkeypatch):
     _install_managed_relay(monkeypatch)
     agent = _build_agent(
