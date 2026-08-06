@@ -441,17 +441,74 @@ def test_claimed_effect_exception_is_unknown_and_next_call_runs(monkeypatch):
         _tool_call("terminal", "call-effect-error", {"command": "do-work"}),
         _tool_call("web_search", "call-after-error", {"query": "next"}),
     )
-    with patch("run_agent.handle_function_call", side_effect=_dispatch) as dispatch:
+    with (
+        patch("run_agent.handle_function_call", side_effect=_dispatch) as dispatch,
+        patch("agent.tool_executor._emit_terminal_post_tool_call") as terminal_row,
+    ):
         agent._execute_tool_calls_sequential(calls, messages, "task-1")
 
     by_id = {message["tool_call_id"]: message for message in messages}
     assert by_id["call-effect-error"]["effect_disposition"] == "unknown"
-    assert "dispatch failed after effect claim" in by_id["call-effect-error"]["content"]
+    assert by_id["call-effect-error"]["content"] == (
+        "Error executing tool 'terminal': dispatch failed after effect claim"
+    )
     assert "ok" in by_id["call-after-error"]["content"]
     assert dispatch.call_count == 2
+    assert terminal_row.call_count == 1
+    assert terminal_row.call_args.kwargs["tool_call_id"] == "call-effect-error"
 
 
-def test_claimed_inline_runtime_exception_is_unknown_and_next_call_runs(
+def test_managed_pre_dispatch_exception_keeps_legacy_error_and_one_hook(
+    monkeypatch,
+):
+    runtime = _ManagedRelayRuntime()
+    original = RuntimeError("Relay failed before callback")
+
+    def _raise_before_callback(*_args, **_kwargs):
+        async def _raise():
+            raise original
+
+        return _raise()
+
+    runtime.run_in_session_async = _raise_before_callback
+    session = SimpleNamespace(handle=object())
+    monkeypatch.setattr(
+        relay_tools.relay_runtime,
+        "resolve_execution_context",
+        lambda _session_id: (runtime, session, None),
+    )
+    agent = _build_agent(
+        "terminal",
+        config={"agent": {"sequential_tool_execution_timeout": 1}},
+    )
+    messages: list[dict] = []
+
+    with (
+        patch("run_agent.handle_function_call") as dispatch,
+        patch("agent.tool_executor._emit_terminal_post_tool_call") as terminal_row,
+    ):
+        agent._execute_tool_calls_sequential(
+            _assistant_message(
+                _tool_call(
+                    "terminal",
+                    "call-pre-dispatch-error",
+                    {"command": "pwd"},
+                )
+            ),
+            messages,
+            "task-1",
+        )
+
+    assert messages[0]["content"] == (
+        "Error executing tool 'terminal': Relay failed before callback"
+    )
+    assert messages[0]["effect_disposition"] == "none"
+    dispatch.assert_not_called()
+    assert terminal_row.call_count == 1
+    assert terminal_row.call_args.kwargs["tool_call_id"] == "call-pre-dispatch-error"
+
+
+def test_claimed_inline_runtime_exception_preserves_legacy_propagation(
     monkeypatch,
 ):
     _install_managed_relay(monkeypatch)
@@ -466,27 +523,25 @@ def test_claimed_inline_runtime_exception_is_unknown_and_next_call_runs(
         _tool_call("web_search", "call-after-inline-error", {"query": "next"}),
     )
 
+    original = RuntimeError("inline dispatch failed after effect claim")
     with (
         patch(
             "tools.todo_tool.todo_tool",
-            side_effect=RuntimeError("inline dispatch failed after effect claim"),
+            side_effect=original,
         ) as inline_dispatch,
         patch(
             "run_agent.handle_function_call",
             return_value='{"ok": true}',
         ) as next_call,
+        pytest.raises(RuntimeError) as caught,
     ):
         agent._execute_tool_calls_sequential(calls, messages, "task-1")
 
-    by_id = {message["tool_call_id"]: message for message in messages}
-    assert by_id["call-inline-error"]["effect_disposition"] == "unknown"
-    assert (
-        "inline dispatch failed after effect claim"
-        in by_id["call-inline-error"]["content"]
-    )
-    assert "ok" in by_id["call-after-inline-error"]["content"]
+    assert caught.value is original
+    assert caught.value.effect_disposition == "unknown"
+    assert messages == []
     inline_dispatch.assert_called_once()
-    next_call.assert_called_once()
+    next_call.assert_not_called()
 
 
 def test_claimed_effect_keyboard_interrupt_marks_only_current_call_unknown(
@@ -571,6 +626,49 @@ def test_claimed_effect_cancelled_error_completes_transcript_before_reraise(
     assert terminal_row.call_args.kwargs["status"] == "cancelled"
     assert dispatch.call_count == 1
     agent.interrupt.assert_called_once()
+
+
+def test_persistence_failure_does_not_swallow_claimed_cancelled_error(
+    monkeypatch,
+):
+    _install_managed_relay(monkeypatch)
+    agent = _build_agent(
+        "terminal",
+        "web_search",
+        config={"agent": {"sequential_tool_execution_timeout": 1}},
+    )
+    messages: list[dict] = []
+    cancellation = asyncio.CancelledError("cancelled before persistence")
+
+    def _mark_interrupted(*_args, **_kwargs) -> None:
+        agent._interrupt_requested = True
+
+    agent.interrupt = MagicMock(side_effect=_mark_interrupted)
+    agent._flush_messages_to_session_db = MagicMock(return_value=False)
+    agent.tool_complete_callback = MagicMock()
+    calls = _assistant_message(
+        _tool_call("terminal", "call-persist-current", {"command": "do-work"}),
+        _tool_call("web_search", "call-persist-rest", {"query": "never"}),
+    )
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=cancellation) as dispatch,
+        pytest.raises(asyncio.CancelledError) as caught,
+    ):
+        agent._execute_tool_calls_sequential(calls, messages, "task-1")
+
+    assert caught.value is cancellation
+    assert [message["tool_call_id"] for message in messages] == [
+        "call-persist-current",
+        "call-persist-rest",
+    ]
+    assert messages[0]["effect_disposition"] == "unknown"
+    assert messages[1]["effect_disposition"] == "none"
+    assert agent._incremental_persistence_failed is True
+    assert agent._flush_messages_to_session_db.call_count == 2
+    agent.tool_complete_callback.assert_not_called()
+    agent.interrupt.assert_called_once()
+    dispatch.assert_called_once()
 
 
 def test_unmanaged_bypass_claimed_interrupt_completes_transcript_before_reraise(
@@ -687,8 +785,87 @@ def test_post_start_gate_timeout_emits_one_completion_after_canonical_row(
     dispatch.assert_not_called()
 
 
+@pytest.mark.parametrize("terminal_kind", ["timeout", "capacity"])
+def test_pre_callback_terminal_result_has_no_start_and_one_completion(
+    monkeypatch,
+    terminal_kind,
+):
+    if terminal_kind == "timeout":
+        runtime = _ManagedRelayRuntime()
+
+        def _never_reaches_callback(*_args, **_kwargs):
+            async def _wedge():
+                await asyncio.Event().wait()
+
+            return _wedge()
+
+        runtime.run_in_session_async = _never_reaches_callback
+        session = SimpleNamespace(handle=object())
+        monkeypatch.setattr(
+            relay_tools.relay_runtime,
+            "resolve_execution_context",
+            lambda _session_id: (runtime, session, None),
+        )
+    else:
+        _install_managed_relay(monkeypatch)
+        monkeypatch.setattr(relay_tools, "_MAX_SEQUENTIAL_RELAY_WORKERS", 0)
+
+    agent = _build_agent(
+        "web_search",
+        config={"agent": {"sequential_tool_execution_timeout": 0.02}},
+    )
+    timeline: list[tuple] = []
+
+    class _RecordingMessages(list):
+        def append(self, message):
+            super().append(message)
+            timeline.append(("canonical-row", message))
+
+    messages = _RecordingMessages()
+    agent.tool_progress_callback = lambda event, name, *_args, **_kwargs: (
+        timeline.append(("progress", event, name))
+    )
+    agent.tool_start_callback = lambda *_args: timeline.append(("structured-start",))
+    agent.tool_complete_callback = lambda *_args: timeline.append((
+        "structured-complete",
+    ))
+
+    with patch("run_agent.handle_function_call") as dispatch:
+        agent._execute_tool_calls_sequential(
+            _assistant_message(
+                _tool_call("web_search", f"call-{terminal_kind}", {"query": "x"})
+            ),
+            messages,
+            "task-1",
+        )
+
+    starts = [
+        event
+        for event in timeline
+        if event[0] == "structured-start" or event[:2] == ("progress", "tool.started")
+    ]
+    progress_completions = [
+        event
+        for event in timeline
+        if event[:3] == ("progress", "tool.completed", "web_search")
+    ]
+    structured_completions = [
+        event for event in timeline if event[0] == "structured-complete"
+    ]
+    canonical_rows = [event for event in timeline if event[0] == "canonical-row"]
+
+    assert starts == []
+    assert len(canonical_rows) == 1
+    assert len(progress_completions) == 1
+    assert len(structured_completions) == 1
+    assert timeline.index(canonical_rows[0]) < timeline.index(progress_completions[0])
+    assert timeline.index(canonical_rows[0]) < timeline.index(structured_completions[0])
+    assert messages[0]["effect_disposition"] == "none"
+    dispatch.assert_not_called()
+
+
 @pytest.mark.parametrize("effect_disposition", ["none", "unknown"])
-def test_timeout_is_truthful_machine_readable_and_next_call_runs(
+def test_timeout_handler_maps_effect_disposition_and_next_call_runs(
     effect_disposition,
 ):
     agent = _build_agent(

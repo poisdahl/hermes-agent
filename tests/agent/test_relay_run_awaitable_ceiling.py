@@ -97,36 +97,34 @@ def test_unmanaged_execution_bypasses_relay_on_the_caller_thread(monkeypatch):
     assert callback_threads == [caller_thread]
 
 
-def test_unmanaged_bypass_honors_interrupt_at_final_effect_gate(monkeypatch):
+def test_unmanaged_bypass_preserves_legacy_dispatch_when_interrupt_is_set(
+    monkeypatch,
+):
     interrupt = threading.Event()
     effects: list[dict[str, Any]] = []
-    callback_attempted = threading.Event()
     execution = _controller(1.0, interrupted=interrupt.is_set)
 
     def _must_not_run(_invoke, _args):  # pragma: no cover - failure path
         raise AssertionError("an unmanaged runtime must be bypassed")
 
     def _callback(args):
-        callback_attempted.set()
         interrupt.set()
         execution.try_begin_effect(lambda: effects.append(args))
-        effects.append(args)
-        return "unexpected"
+        return "done"
 
     _patch_runtime(monkeypatch, _FakeRuntime(_must_not_run, managed=False))
-    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
-        relay_tools.execute(
-            "write_file",
-            {"path": "result.txt"},
-            _callback,
-            session_id="session-1",
-            sequential_execution=execution,
-        )
+    args = {"path": "result.txt"}
+    result, observed_args = relay_tools.execute(
+        "write_file",
+        args,
+        _callback,
+        session_id="session-1",
+        sequential_execution=execution,
+    )
 
-    assert callback_attempted.is_set()
-    assert caught.value.reason == "interrupt"
-    assert caught.value.effect_disposition == "none"
-    assert effects == []
+    assert result == "done"
+    assert observed_args is args
+    assert effects == [args]
 
 
 def test_managed_callback_runs_on_the_caller_thread(monkeypatch):
@@ -154,6 +152,39 @@ def test_managed_callback_runs_on_the_caller_thread(monkeypatch):
     assert callback_threads == [caller_thread]
     assert result == {"ok": 7}
     assert observed_args == {"value": 7}
+
+
+def test_callback_exception_is_raised_only_on_owner_thread(monkeypatch):
+    original = RuntimeError("owner callback failed")
+    execution = _controller(1.0)
+
+    async def _invoke_once(invoke, args):
+        return invoke(args)
+
+    def _callback(_args):
+        _begin_effect(execution)
+        raise original
+
+    _patch_runtime(monkeypatch, _FakeRuntime(_invoke_once))
+    with pytest.raises(RuntimeError) as caught:
+        relay_tools.execute(
+            "tool",
+            {},
+            _callback,
+            session_id="session-1",
+            sequential_execution=execution,
+        )
+
+    with execution._condition:
+        assert execution._condition.wait_for(
+            lambda: execution._worker_done,
+            timeout=2,
+        )
+        worker_error = execution._worker_error
+
+    assert caught.value is original
+    assert isinstance(worker_error, relay_tools._SequentialRelayCallbackError)
+    assert worker_error is not original
 
 
 def test_managed_handoff_preserves_caller_contextvars(monkeypatch):
@@ -269,6 +300,35 @@ def test_cancel_swallowing_worker_cannot_invoke_after_timeout(monkeypatch):
     assert len(late_errors) == 1
     assert isinstance(late_errors[0], relay_tools.SequentialRelayToolTimeout)
     assert late_errors[0].effect_disposition == "none"
+
+
+def test_expired_pending_request_is_rejected_before_owner_callback(monkeypatch):
+    execution = _controller(1.0)
+    callback_calls: list[dict[str, Any]] = []
+    clock_values = iter((0.0, 2.0))
+
+    async def _unused_worker():  # pragma: no cover - closed by fake starter
+        return None
+
+    def _publish_pending_request(value) -> None:
+        value.close()
+        with execution._condition:
+            execution._request = {"late": True}
+            execution._condition.notify_all()
+
+    monkeypatch.setattr(relay_tools.time, "monotonic", lambda: next(clock_values))
+    monkeypatch.setattr(execution, "_reserve_worker", lambda _value: None)
+    monkeypatch.setattr(execution, "_start_worker", _publish_pending_request)
+
+    with pytest.raises(relay_tools.SequentialRelayToolTimeout) as caught:
+        execution.run(
+            _unused_worker(),
+            lambda args: callback_calls.append(args),
+        )
+
+    assert caught.value.reason == "deadline"
+    assert caught.value.effect_disposition == "none"
+    assert callback_calls == []
 
 
 def test_effect_claim_is_atomic_with_deadline_expiry():
@@ -499,7 +559,10 @@ def test_owner_baseexception_abandons_worker_and_blocks_late_effect(monkeypatch)
     assert final_abandoned == baseline_abandoned
 
 
-def test_sequential_worker_capacity_fails_closed_without_dispatch(monkeypatch):
+def test_sequential_worker_capacity_fails_closed_without_dispatch(
+    monkeypatch,
+    caplog,
+):
     callback_calls: list[dict[str, Any]] = []
 
     async def _invoke_once(invoke, args):  # pragma: no cover - capacity wins
@@ -508,17 +571,23 @@ def test_sequential_worker_capacity_fails_closed_without_dispatch(monkeypatch):
     _patch_runtime(monkeypatch, _FakeRuntime(_invoke_once))
     monkeypatch.setattr(relay_tools, "_MAX_SEQUENTIAL_RELAY_WORKERS", 0)
 
-    with pytest.raises(relay_tools.SequentialRelayToolCapacityError) as caught:
-        relay_tools.execute(
-            "tool",
-            {},
-            lambda args: callback_calls.append(args),
-            session_id="session-1",
-            sequential_execution=_controller(1.0),
-        )
+    with caplog.at_level("WARNING", logger="agent.relay_tools"):
+        with pytest.raises(relay_tools.SequentialRelayToolCapacityError) as caught:
+            relay_tools.execute(
+                "tool",
+                {},
+                lambda args: callback_calls.append(args),
+                session_id="session-1",
+                sequential_execution=_controller(1.0),
+            )
 
     assert caught.value.effect_disposition == "none"
     assert callback_calls == []
+    assert "active-worker limit" in caplog.text
+    assert "active=" in caplog.text
+    assert "/0" in caplog.text
+    assert "abandoned=" in caplog.text
+    assert "/16" in caplog.text
 
 
 def test_unbounded_awaitable_keeps_original_value_and_loop_contract():

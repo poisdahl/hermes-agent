@@ -68,6 +68,15 @@ class SequentialRelayToolCapacityError(BaseException):
         )
 
 
+class _SequentialRelayCallbackError(BaseException):
+    """Worker-only sentinel for an owner-thread Hermes callback failure.
+
+    The original exception belongs to the owner thread and is re-raised there.
+    Raising the same instance concurrently from the Relay worker would race its
+    traceback and exception-context mutation across two threads.
+    """
+
+
 class _SequentialRelayInvocation:
     """Run Relay off-thread while keeping the Hermes callback on its owner.
 
@@ -120,9 +129,12 @@ class _SequentialRelayInvocation:
         with self._condition:
             if self._effect_started:
                 raise RuntimeError("Hermes tool effect was claimed more than once")
-            # Even an unmanaged Relay bypass must honor a late user interrupt.
-            # Only the deadline portion depends on ``_arm()`` having run.
-            self._raise_if_unavailable_locked()
+            # Managed Relay arms the controller before it can publish a
+            # callback, so its final deadline/interrupt gate runs here.  An
+            # unmanaged or Relay-free bypass stays unarmed and preserves the
+            # legacy caller-thread dispatch contract.
+            if self._armed or self._abandoned:
+                self._raise_if_unavailable_locked()
             if on_claim is not None:
                 on_claim()
             self._effect_started = True
@@ -199,19 +211,28 @@ class _SequentialRelayInvocation:
 
     def _reserve_worker(self, value: Any) -> None:
         global _active_sequential_relay_workers
-        rejected = False
+        rejection_reason: str | None = None
         with _sequential_worker_lock:
-            if (
-                _active_sequential_relay_workers >= _MAX_SEQUENTIAL_RELAY_WORKERS
-                or _abandoned_sequential_relay_workers
-                >= _MAX_ABANDONED_SEQUENTIAL_RELAY_WORKERS
-            ):
-                rejected = True
+            active_workers = _active_sequential_relay_workers
+            abandoned_workers = _abandoned_sequential_relay_workers
+            if abandoned_workers >= _MAX_ABANDONED_SEQUENTIAL_RELAY_WORKERS:
+                rejection_reason = "abandoned-worker limit"
+            elif active_workers >= _MAX_SEQUENTIAL_RELAY_WORKERS:
+                rejection_reason = "active-worker limit"
             else:
                 _active_sequential_relay_workers += 1
                 self._worker_reserved = True
-        if rejected:
+        if rejection_reason is not None:
             _close_awaitable(value)
+            logger.warning(
+                "Rejecting sequential Relay execution at %s: active=%d/%d, "
+                "abandoned=%d/%d",
+                rejection_reason,
+                active_workers,
+                _MAX_SEQUENTIAL_RELAY_WORKERS,
+                abandoned_workers,
+                _MAX_ABANDONED_SEQUENTIAL_RELAY_WORKERS,
+            )
             raise SequentialRelayToolCapacityError()
 
     def _release_worker(self) -> None:
@@ -344,8 +365,18 @@ class _SequentialRelayInvocation:
                         self._condition.wait(timeout=min(remaining, 0.05))
                     if timeout is None and self._request is not _MISSING:
                         if not self._request_consumed:
-                            request = self._request
-                            self._request_consumed = True
+                            # The worker checked availability immediately
+                            # before publication, but the owner may not observe
+                            # the request until after expiry.  Reject it before
+                            # running any owner-thread middleware or preflight;
+                            # the final effect gate still closes the later race.
+                            if self._interrupted_locked():
+                                timeout = self._timeout_locked(reason="interrupt")
+                            elif self._remaining_locked() <= 0:
+                                timeout = self._timeout_locked(reason="deadline")
+                            else:
+                                request = self._request
+                                self._request_consumed = True
                         elif not self._worker_done:
                             # A response has been published; only Relay suffix
                             # work remains, still bounded by the original deadline.
@@ -366,7 +397,7 @@ class _SequentialRelayInvocation:
                     try:
                         response = callback(request)
                     except BaseException as exc:
-                        self._publish_response(error=exc)
+                        self._publish_response(error=_SequentialRelayCallbackError())
                         self._abandon_worker(
                             reason=(
                                 "interrupt"

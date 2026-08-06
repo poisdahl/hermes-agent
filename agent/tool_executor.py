@@ -693,30 +693,6 @@ def _run_agent_tool_execution_middleware(
             timed_out=True,
             effect_disposition="none",
         )
-    except Exception as exc:
-        if sequential_execution is None or not sequential_execution.armed:
-            raise
-        effect_disposition = "unknown" if state["dispatched"] else "none"
-        message = f"Error executing tool '{function_name}': {exc}"
-        logger.error(message, exc_info=True)
-        result = json.dumps(
-            {
-                "error": message,
-                "error_type": type(exc).__name__,
-                "message": message,
-                "success": False,
-                "effect_disposition": effect_disposition,
-            },
-            ensure_ascii=False,
-        )
-        return _ManagedToolResult(
-            result=result,
-            args=state["args"],
-            middleware_trace=state["middleware_trace"],
-            blocked=False,
-            dispatched=bool(state["dispatched"]),
-            effect_disposition=effect_disposition,
-        )
     except (asyncio.CancelledError, KeyboardInterrupt) as exc:
         if sequential_execution is None:
             try:
@@ -1896,7 +1872,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except BaseException as exc:
                 disposition = getattr(exc, "effect_disposition", None)
                 _execution_effect_disposition = disposition
-                _execution_dispatched = disposition == "unknown"
                 raise
             _execution_timed_out = outcome.timed_out
             _execution_effect_disposition = outcome.effect_disposition
@@ -2448,11 +2423,41 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
+
+        def _reraise_deferred_cancellation() -> None:
+            if _execution_cancelled_error is None:
+                return
+            interrupt_reason = (
+                "keyboard interrupt"
+                if isinstance(_execution_cancelled_error, KeyboardInterrupt)
+                else "tool callback cancellation"
+            )
+            try:
+                agent.interrupt(interrupt_reason)
+            except Exception:
+                pass
+            remaining_calls = assistant_message.tool_calls[i:]
+            if remaining_calls:
+                _append_cancelled_tool_results(
+                    messages,
+                    remaining_calls,
+                    reason=interrupt_reason,
+                )
+                _flush_session_db_after_tool_progress(
+                    agent,
+                    messages,
+                    stage="cancelled remaining sequential tool results",
+                )
+            raise _execution_cancelled_error
+
         if not _flush_session_db_after_tool_progress(
             agent,
             messages,
             stage=f"tool result {function_name}",
         ):
+            # Persistence failure still aborts the turn, but it must not turn a
+            # hard cancellation into a normal return or replace its identity.
+            _reraise_deferred_cancellation()
             return
 
         # UI completion/progress events are projections of the canonical tool
@@ -2514,29 +2519,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if _execution_cancelled_error is not None:
-            interrupt_reason = (
-                "keyboard interrupt"
-                if isinstance(_execution_cancelled_error, KeyboardInterrupt)
-                else "tool callback cancellation"
-            )
-            try:
-                agent.interrupt(interrupt_reason)
-            except Exception:
-                pass
-            remaining_calls = assistant_message.tool_calls[i:]
-            if remaining_calls:
-                _append_cancelled_tool_results(
-                    messages,
-                    remaining_calls,
-                    reason=interrupt_reason,
-                )
-                _flush_session_db_after_tool_progress(
-                    agent,
-                    messages,
-                    stage="cancelled remaining sequential tool results",
-                )
-            raise _execution_cancelled_error
+        _reraise_deferred_cancellation()
 
         if agent._interrupt_requested and i < len(assistant_message.tool_calls):
             remaining = len(assistant_message.tool_calls) - i
