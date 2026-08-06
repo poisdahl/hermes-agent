@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -59,6 +60,8 @@ from utils import base_url_host_matches, is_truthy_value
 # ``logger = logging.getLogger(__name__)``, which resolves to "run_agent"
 # from inside that module.)
 logger = logging.getLogger("run_agent")
+
+_DEFAULT_SEQUENTIAL_TOOL_EXECUTION_TIMEOUT_S = 660.0
 
 
 def _ra():
@@ -454,6 +457,19 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
         merged_extra_body.update(existing_extra_body)
     overrides["extra_body"] = merged_extra_body
     agent.request_overrides = overrides
+
+
+def _normalize_sequential_tool_execution_timeout(value: Any) -> float | None:
+    """Return the sequential Relay timeout, or ``None`` when disabled."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("timeout must be a number or numeric string")
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("timeout must be a number or numeric string") from exc
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout must be finite and non-negative")
+    return None if timeout == 0 else timeout
 
 
 def init_agent(
@@ -1615,6 +1631,28 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+
+    _sequential_timeout_raw: Any = _DEFAULT_SEQUENTIAL_TOOL_EXECUTION_TIMEOUT_S
+    _agent_section = _agent_cfg.get("agent", {})
+    if isinstance(_agent_section, dict):
+        _sequential_timeout_raw = _agent_section.get(
+            "sequential_tool_execution_timeout",
+            _DEFAULT_SEQUENTIAL_TOOL_EXECUTION_TIMEOUT_S,
+        )
+    try:
+        agent._sequential_tool_execution_timeout_s = (
+            _normalize_sequential_tool_execution_timeout(_sequential_timeout_raw)
+        )
+    except ValueError:
+        logger.warning(
+            "Invalid agent.sequential_tool_execution_timeout=%r; expected a "
+            "finite non-negative number of seconds (0 disables). Using default "
+            "660 seconds.",
+            _sequential_timeout_raw,
+        )
+        agent._sequential_tool_execution_timeout_s = (
+            _DEFAULT_SEQUENTIAL_TOOL_EXECUTION_TIMEOUT_S
+        )
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

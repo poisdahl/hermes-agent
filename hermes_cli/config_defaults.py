@@ -30,6 +30,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Safety deadline for Relay's sequential tool orchestration (seconds).
+        # The deadline may stop Relay only before the real tool effect starts;
+        # once an effect starts, Hermes remains attached until it finishes.
+        # 0 = disabled.
+        "sequential_tool_execution_timeout": 660,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has

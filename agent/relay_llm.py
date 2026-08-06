@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_await, relay_runtime
+from agent import relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -1227,10 +1228,12 @@ def _json_equal(left: Any, right: Any) -> bool:
 
 
 def _run_awaitable(value: Any) -> Any:
-    return relay_await.run_awaitable(
-        value,
-        on_loop_error=(
-            "Synchronous Relay LLM execution cannot run on an event-loop thread"
-        ),
-        hard_deadline_floor=relay_await.LLM_HARD_DEADLINE_FLOOR_S,
+    if not inspect.isawaitable(value):
+        return value
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(value)
+    raise RuntimeError(
+        "Synchronous Relay LLM execution cannot run on an event-loop thread"
     )

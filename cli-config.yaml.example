@@ -821,6 +821,11 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Safety deadline for Relay's sequential tool orchestration (seconds).
+  # It can stop Relay only before the real tool effect starts. Once an effect
+  # starts, Hermes remains attached until it finishes. Set to 0 to disable.
+  # sequential_tool_execution_timeout: 660
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.
