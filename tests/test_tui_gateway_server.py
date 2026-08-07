@@ -4247,7 +4247,7 @@ def test_prompt_submit_rejects_negative_truncate_ordinal(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4301,7 +4301,7 @@ def test_prompt_submit_refuses_unconfirmed_nonempty_truncation(monkeypatch):
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4358,13 +4358,13 @@ def test_prompt_submit_refuses_empty_truncation_without_confirm(monkeypatch):
     """A confirmed rewind still must not wipe a non-empty transcript by accident.
 
     Ordinal 0 cuts at the first user message (history[:0] == []) and
-    replace_messages() would DELETE every durable row. Even a submit that
+    replace_messages() would DELETE every durable live row. Even a submit that
     declares rewind intent needs the second opt-in for that edge.
     """
     replaced = []
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *, active_only=False):
             replaced.append((key, list(messages)))
 
     history = [
@@ -4451,7 +4451,8 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
             self._target()
 
     class _FakeDB:
-        def replace_messages(self, key, messages):
+        def replace_messages(self, key, messages, *, active_only=False):
+            assert active_only is True
             replaced.append((key, list(messages)))
 
     history = [
@@ -9344,7 +9345,8 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, *, active_only=False):
+            assert active_only is True
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()
@@ -9383,6 +9385,94 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_confirmed_truncate_preserves_compaction_archive(
+    monkeypatch, tmp_path
+):
+    """A live rewind must not delete inactive pre-compaction history.
+
+    ``session["history"]`` contains only the active compacted view, while the
+    same SessionDB id also owns inactive rows retained by
+    ``archive_and_compact``.  Replacing every row from that partial view loses
+    the durable archive.  Exercise the real prompt.submit path and real SQLite
+    store so the archive identity/content contract cannot be hidden by a fake.
+    """
+    from hermes_state import SessionDB
+
+    class _DormantThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_key = "compacted-truncate-session"
+    db.create_session(session_key, source="tui", model="test/model")
+    for message in (
+        {"role": "user", "content": "archived question one"},
+        {"role": "assistant", "content": "archived answer one"},
+        {"role": "user", "content": "archived question two"},
+        {"role": "assistant", "content": "archived answer two"},
+    ):
+        db.append_message(session_key, **message)
+
+    live_history = [
+        {"role": "user", "content": "compacted summary"},
+        {"role": "assistant", "content": "summary acknowledged"},
+        {"role": "user", "content": "latest question"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    db.archive_and_compact(session_key, live_history)
+    archived_before = [
+        row for row in db.get_messages(session_key, include_inactive=True)
+        if not row["active"]
+    ]
+    assert len(archived_before) == 4
+
+    sid = "compacted-truncate-sid"
+    server._sessions[sid] = _session(
+        session_key=session_key,
+        history=list(live_history),
+        model_override={"model": "test/model", "provider": "test"},
+    )
+    try:
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda *_a: None)
+        monkeypatch.setattr(server.threading, "Thread", _DormantThread)
+
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": sid,
+                    "text": "edited latest question",
+                    "truncate_before_user_ordinal": 1,
+                    "confirm_truncate": True,
+                },
+            }
+        )
+
+        assert response.get("result"), response
+        active_after = db.get_messages(session_key)
+        assert [row["content"] for row in active_after] == [
+            "compacted summary",
+            "summary acknowledged",
+        ]
+        archived_after = [
+            row for row in db.get_messages(session_key, include_inactive=True)
+            if not row["active"]
+        ]
+        assert archived_after == archived_before
+    finally:
+        server._sessions.pop(sid, None)
+        db.close()
+
+
 def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     """If replace_messages fails during edit/regenerate truncate, do not run the turn.
 
@@ -9401,7 +9491,8 @@ def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
     server._sessions["trunc-fail-sid"] = sess
 
     class _FailDb:
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, *, active_only=False):
+            assert active_only is True
             raise OSError("disk full")
 
     monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
@@ -9493,7 +9584,8 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
         def __init__(self):
             self.replaced = []
 
-        def replace_messages(self, session_id, messages):
+        def replace_messages(self, session_id, messages, *, active_only=False):
+            assert active_only is True
             self.replaced.append((session_id, list(messages)))
 
     stub_db = _StubDb()

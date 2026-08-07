@@ -202,7 +202,7 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             # Second gate, on top of confirm_truncate: ordinal 0 resolves to
             # history[:0] == [] and replace_messages() DELETEs every durable
-            # row. A confirmed rewind that happens to erase the whole
+            # live row. A confirmed rewind that happens to erase the whole
             # transcript still needs its own opt-in (legitimate restore/
             # regenerate of the first user turn).
             if (
@@ -244,7 +244,13 @@ def _(rid, params: dict) -> dict:
             # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
-                    db.replace_messages(session["session_key"], truncated)
+                    # session["history"] is the live view.  In-place
+                    # compaction keeps its prior turns as inactive rows under
+                    # the same session id, so a full replacement here would
+                    # silently delete that durable archive.
+                    db.replace_messages(
+                        session["session_key"], truncated, active_only=True
+                    )
                 except Exception as exc:
                     logger.error(
                         "prompt.submit: replace_messages failed for session %s "
