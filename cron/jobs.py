@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import json
 import logging
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -112,6 +113,14 @@ _jobs_lock_state = threading.local()
 # legitimate critical section (field updates only) while keeping the ticker's
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
+# The final read/reconcile/replace section is much shorter than a full cron
+# mutation.  Every writer takes this second lock even when the broader lock
+# degraded, so two current Hermes processes cannot race between reconciliation
+# and publication.  Failure is closed here: publishing a known-stale snapshot
+# is worse than making the caller retry a save.
+_JOBS_COMMIT_LOCK_TIMEOUT_SECONDS = 5.0
+_JOBS_GENERATION_MAX_ATTEMPTS = 3
+_JOB_ID_REPAIR_MAX_ATTEMPTS = 16
 OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
@@ -121,6 +130,17 @@ class _CronStorePaths:
     cron_dir: Path
     jobs_file: Path
     output_dir: Path
+
+
+_JobsFileStamp = Tuple[int, int, int, int, int]
+
+
+@dataclass(frozen=True)
+class _JobsFileSnapshot:
+    exists: bool
+    data: Any
+    stamp: Optional[_JobsFileStamp]
+    strict_retry: bool = False
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -267,6 +287,148 @@ def _jobs_lock_file() -> Path:
     return _current_cron_store().cron_dir / ".jobs.lock"
 
 
+def _jobs_commit_lock_file() -> Path:
+    """Return the short-held publication lock for the current cron store."""
+    return _current_cron_store().cron_dir / ".jobs.commit.lock"
+
+
+@contextlib.contextmanager
+def _jobs_commit_lock():
+    """Serialize the coherent re-read and atomic publication of jobs.json.
+
+    The broader ``_jobs_lock`` deliberately fails open after its timeout so a
+    wedged process cannot stop the scheduler forever (#60703).  That means a
+    healthy writer and a degraded writer can both reach ``save_jobs``.  This
+    separate lock is held only for the final read/reconcile/fsync/replace and
+    is therefore safe to fail closed: if it cannot be acquired promptly, no
+    potentially stale payload is published.
+    """
+    lock_path = _jobs_commit_lock_file()
+    lock_fd = None
+    locked = False
+    acquisition_error = None
+    try:
+        try:
+            parent_stat = os.stat(lock_path.parent)
+            if os.name == "posix":
+                nofollow = getattr(os, "O_NOFOLLOW", None)
+                cloexec = getattr(os, "O_CLOEXEC", None)
+                if nofollow is None or cloexec is None:
+                    raise OSError(
+                        "secure no-follow/close-on-exec open flags unavailable"
+                    )
+                raw_fd = os.open(
+                    lock_path,
+                    os.O_RDWR | os.O_CREAT | nofollow | cloexec,
+                    0o600,
+                )
+                try:
+                    lock_stat = os.fstat(raw_fd)
+                    if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_nlink != 1:
+                        raise OSError(
+                            "cron jobs commit lock is not a singly-linked regular file"
+                        )
+                    # Operate only on the descriptor returned by the no-follow
+                    # open. A path chmod/chown here can be redirected by a
+                    # symlink or a rename between validation and mutation.
+                    os.fchmod(raw_fd, 0o600)
+                    _preserve_fd_ownership(
+                        raw_fd, parent_stat, "cron jobs commit lock"
+                    )
+                    lock_fd = os.fdopen(raw_fd, "r+", encoding="utf-8")
+                    raw_fd = -1
+                finally:
+                    if raw_fd >= 0:
+                        os.close(raw_fd)
+            else:
+                lock_fd = open(lock_path, "a+", encoding="utf-8")
+            if fcntl is None and msvcrt is None:
+                raise OSError("no cross-process file locking backend available")
+            if fcntl is None and msvcrt is not None:
+                # msvcrt.locking() locks a byte range from the current offset.
+                # Match the other Windows locks in hermes_cli/auth.py and
+                # gateway/status.py: seed a real byte and reset the offset.
+                lock_fd.seek(0, os.SEEK_END)
+                if lock_fd.tell() == 0:
+                    lock_fd.write(" ")
+                    lock_fd.flush()
+                lock_fd.seek(0)
+            else:
+                lock_fd.seek(0)
+            deadline = time.monotonic() + _JOBS_COMMIT_LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    elif msvcrt is not None:
+                        lock_fd.seek(0)
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+                        )
+                    else:  # guarded above; keeps platform narrowing explicit
+                        raise AssertionError("unreachable locking backend state")
+                    locked = True
+                    break
+                except (OSError, IOError) as exc:
+                    acquisition_error = exc
+                    if time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+        except (OSError, IOError) as exc:
+            acquisition_error = exc
+
+        if not locked:
+            raise RuntimeError(
+                "Could not acquire the cron jobs commit lock within "
+                f"{_JOBS_COMMIT_LOCK_TIMEOUT_SECONDS:g}s; refusing to publish "
+                "a potentially stale jobs.json snapshot"
+            ) from acquisition_error
+        if lock_fd is None:  # narrowed above; defensive for static analysis
+            raise AssertionError("locked cron jobs commit lock has no descriptor")
+
+        def validate_lock_identity() -> None:
+            if os.name != "posix":
+                return
+            try:
+                fd_stat = os.fstat(lock_fd.fileno())
+                path_stat = os.stat(lock_path, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(fd_stat.st_mode)
+                    or fd_stat.st_nlink != 1
+                    or not stat.S_ISREG(path_stat.st_mode)
+                    or (fd_stat.st_dev, fd_stat.st_ino)
+                    != (path_stat.st_dev, path_stat.st_ino)
+                ):
+                    raise OSError(
+                        "cron jobs commit lock path changed after descriptor open"
+                    )
+            except (OSError, IOError) as exc:
+                raise RuntimeError(
+                    "Cron jobs commit lock identity changed; refusing to publish "
+                    "a potentially stale jobs.json snapshot"
+                ) from exc
+
+        validate_lock_identity()
+        yield validate_lock_identity
+    finally:
+        if lock_fd is not None:
+            if locked:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    elif msvcrt is not None:
+                        lock_fd.seek(0)
+                        getattr(msvcrt, "locking")(
+                            lock_fd.fileno(), getattr(msvcrt, "LK_UNLCK"), 1
+                        )
+                except (OSError, IOError):
+                    pass
+            try:
+                lock_fd.close()
+            except OSError:
+                pass
+
+
 @contextlib.contextmanager
 def _jobs_lock():
     """Serialize a load_jobs→modify→save_jobs critical section.
@@ -289,8 +451,8 @@ def _jobs_lock():
 
     Whenever the cross-process flock could not actually be acquired (timeout,
     OSError, or neither fcntl/msvcrt available), ``_jobs_lock_state.degraded``
-    is set so ``_save_jobs_unlocked`` can detect and recover from a sibling
-    process writing jobs.json during the unprotected window (#80624).
+    records that fact for diagnostics.  Save still uses a separate short-held
+    commit lock and coherent reconciliation to protect publication (#80624).
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -304,8 +466,7 @@ def _jobs_lock():
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
         _jobs_lock_state.degraded = False
-        _jobs_lock_state.load_stamp = None
-        _jobs_lock_state.load_ids = None
+        _jobs_lock_state.load_jobs = None
         lock_fd = None
         locked = False
         try:
@@ -326,8 +487,9 @@ def _jobs_lock():
                     # error logged.  Poll LOCK_NB against a deadline instead;
                     # on timeout, log loudly and fall through to the same
                     # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
+                    # unavailable.  Publication remains serialized later by
+                    # the much shorter commit lock; the broad mutation lock is
+                    # what must never freeze the scheduler permanently.
                     _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
                     while True:
                         try:
@@ -376,8 +538,7 @@ def _jobs_lock():
         finally:
             _jobs_lock_state.depth = 0
             _jobs_lock_state.degraded = False
-            _jobs_lock_state.load_stamp = None
-            _jobs_lock_state.load_ids = None
+            _jobs_lock_state.load_jobs = None
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -504,8 +665,25 @@ def _secure_file(path: Path):
         pass
 
 
+def _ownership_to_restore(
+    before: Optional[os.stat_result],
+) -> Optional[Tuple[int, int]]:
+    """Return the prior owner only when a privileged POSIX writer changed it."""
+    if before is None or os.name != "posix":
+        return None
+    geteuid = getattr(os, "geteuid", None)
+    getegid = getattr(os, "getegid", None)
+    if geteuid is None or getegid is None:
+        return None
+    euid, egid = geteuid(), getegid()
+    if euid != 0:
+        return None
+    owner = (before.st_uid, before.st_gid)
+    return None if owner == (euid, egid) else owner
+
+
 def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> None:
-    """Restore a rewritten file's previous owner (POSIX, privileged writer only).
+    """Restore a rewritten file's previous owner (privileged POSIX writer only).
 
     The atomic-write pattern (mkstemp + replace) makes the rewritten file owned
     by the *writer's* euid. When a root shell runs a state-writing cron CLI
@@ -520,25 +698,46 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
     a root-owned file back to their uid, and they couldn't chown anyway).
     No-op on Windows. Best-effort: a failure must never break the save.
     """
-    if before is None or os.name != "posix":
-        return
-    geteuid = getattr(os, "geteuid", None)
-    getegid = getattr(os, "getegid", None)
-    if geteuid is None or getegid is None:
+    owner = _ownership_to_restore(before)
+    if owner is None:
         return
     try:
-        euid = geteuid()
-        if euid != 0:
-            return  # unprivileged writer — nothing to (or we could) restore
-        if (before.st_uid, before.st_gid) == (euid, getegid()):
-            return  # already ours before the rewrite — nothing changed
-        os.chown(path, before.st_uid, before.st_gid)
+        os.chown(path, *owner)
     except OSError as e:
         logger.warning(
             "Could not restore ownership of %s to uid=%s gid=%s after rewrite: %s "
             "— if the gateway runs as a different user, its cron ticker may now "
             "be locked out (see issue #68483).",
-            path, before.st_uid, before.st_gid, e,
+            path,
+            owner[0],
+            owner[1],
+            e,
+        )
+
+
+def _preserve_fd_ownership(
+    fd: int, before: Optional[os.stat_result], description: str
+) -> None:
+    """Restore owner through an already-validated descriptor when root writes.
+
+    Commit-lock security depends on never resolving its pathname again for a
+    metadata mutation: a path-based chown can be redirected after open. This
+    descriptor variant deliberately mirrors ``_preserve_file_ownership``'s
+    root-only, best-effort ownership policy.
+    """
+    owner = _ownership_to_restore(before)
+    fchown = getattr(os, "fchown", None)
+    if owner is None or fchown is None:
+        return
+    try:
+        fchown(fd, *owner)
+    except OSError as exc:
+        logger.warning(
+            "Could not restore ownership of %s to uid=%s gid=%s: %s",
+            description,
+            owner[0],
+            owner[1],
+            exc,
         )
 
 
@@ -1025,179 +1224,525 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
-def _record_load_stamp(jobs_file: Path, jobs: List[Dict[str, Any]]) -> None:
-    """Snapshot the file state + job IDs a load_jobs() call observed.
+def _stamp_from_stat(st: os.stat_result) -> _JobsFileStamp:
+    """Return the generation fields used to identify one jobs.json inode."""
+    return (st.st_dev, st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+
+
+def _jobs_file_stamp(jobs_file: Path) -> Optional[_JobsFileStamp]:
+    """Return the generation currently reachable through ``jobs_file``."""
+    try:
+        return _stamp_from_stat(jobs_file.stat())
+    except FileNotFoundError:
+        return None
+
+
+def _read_jobs_file_snapshot(jobs_file: Path) -> _JobsFileSnapshot:
+    """Read JSON and identity from one descriptor without mutating lock state.
+
+    Atomic replacement changes which inode the path names while an already-open
+    descriptor continues to expose the old bytes.  Capturing ``fstat`` from the
+    descriptor that supplied the JSON keeps those two facts coherent.  The
+    before/after check also retries a rare in-place writer instead of accepting
+    bytes paired with metadata from two different moments.
+    """
+    last_decode_error = None
+    last_attempt_was_decode_error = False
+    for _attempt in range(_JOBS_GENERATION_MAX_ATTEMPTS):
+        try:
+            with open(jobs_file, "rb") as f:
+                before_stat = os.fstat(f.fileno())
+                payload = f.read()
+                after_stat = os.fstat(f.fileno())
+        except FileNotFoundError:
+            return _JobsFileSnapshot(exists=False, data=None, stamp=None)
+        before = _stamp_from_stat(before_stat)
+        after = _stamp_from_stat(after_stat)
+        if before != after:
+            last_attempt_was_decode_error = False
+            continue
+        try:
+            payload_text = payload.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            last_decode_error = exc
+            last_attempt_was_decode_error = True
+            continue
+
+        strict_retry = False
+        try:
+            data = json.loads(payload_text)
+        except json.JSONDecodeError:
+            strict_retry = True
+            try:
+                data = json.loads(payload_text, strict=False)
+            except json.JSONDecodeError as exc:
+                # Do not keep retrying the bytes from this descriptor. A
+                # sibling may already have atomically installed a valid
+                # generation, so close/reopen on the next bounded attempt.
+                last_decode_error = exc
+                last_attempt_was_decode_error = True
+                continue
+        return _JobsFileSnapshot(
+            exists=True,
+            data=data,
+            stamp=after,
+            strict_retry=strict_retry,
+        )
+    if last_attempt_was_decode_error and last_decode_error is not None:
+        raise last_decode_error
+    raise RuntimeError("Cron database changed repeatedly while it was being read")
+
+
+def _jobs_from_snapshot(snapshot: _JobsFileSnapshot) -> List[Dict[str, Any]]:
+    """Validate and return a snapshot's jobs without repairing or recording it."""
+    if not snapshot.exists:
+        return []
+    if isinstance(snapshot.data, dict):
+        result = snapshot.data.get("jobs", [])
+    elif isinstance(snapshot.data, list):
+        result = snapshot.data
+    else:
+        raise RuntimeError(
+            "Cron database corrupted: expected {'jobs': [...]}, got "
+            f"{type(snapshot.data).__name__}"
+        )
+    if not isinstance(result, list):
+        raise RuntimeError(
+            "Cron database corrupted: expected 'jobs' to be a list, got "
+            f"{type(result).__name__}"
+        )
+    return result
+
+
+def _record_load_snapshot(jobs: List[Dict[str, Any]]) -> None:
+    """Record a deep-copied B snapshot for a later three-way save.
 
     Only meaningful inside a _jobs_lock() critical section (depth > 0); lets
-    _save_jobs_unlocked() detect a sibling process writing jobs.json during a
-    degraded (unlocked) window and recover any job it added instead of
-    silently discarding it (#80624).
+    _save_jobs_unlocked() compare the caller's desired D with the exact B it
+    loaded and the latest current C. The deep copy is essential because most
+    cron callers mutate the returned list and nested job dictionaries in place.
     """
     if not getattr(_jobs_lock_state, "depth", 0):
         return
+    _jobs_lock_state.load_jobs = copy.deepcopy(jobs)
+
+
+def _read_validated_jobs_snapshot(
+    jobs_file: Path,
+) -> Tuple[_JobsFileSnapshot, List[Dict[str, Any]]]:
+    """Read one coherent generation and expose storage failures uniformly."""
     try:
-        st = jobs_file.stat()
-        stamp = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        stamp = None
-    _jobs_lock_state.load_stamp = stamp
-    _jobs_lock_state.load_ids = {j["id"] for j in jobs if isinstance(j, dict) and "id" in j}
+        snapshot = _read_jobs_file_snapshot(jobs_file)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError(
+            f"Cron database corrupted and unrepairable: {exc}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(f"Failed to read cron database: {exc}") from exc
+    return snapshot, _jobs_from_snapshot(snapshot)
+
+
+def _snapshot_repair_reason(snapshot: _JobsFileSnapshot) -> Optional[str]:
+    if not snapshot.exists:
+        return None
+    if isinstance(snapshot.data, dict) and snapshot.strict_retry:
+        return "had invalid control characters"
+    if isinstance(snapshot.data, list):
+        return "bare list wrapped as dict"
+    return None
+
+
+def _repair_jobs_snapshot(jobs_file: Path) -> List[Dict[str, Any]]:
+    """Re-read under the broad lock and normalize only the latest generation."""
+    with _jobs_lock():
+        snapshot, current_jobs = _read_validated_jobs_snapshot(jobs_file)
+        _record_load_snapshot(current_jobs)
+        reason = _snapshot_repair_reason(snapshot)
+        if reason is None:
+            return current_jobs
+        repaired_jobs = _save_jobs_unlocked(current_jobs)
+        logger.warning("Auto-repaired jobs.json (%s)", reason)
+        return repaired_jobs
 
 
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
-    if not jobs_file.exists():
-        _record_load_stamp(jobs_file, [])
-        return []
-
-    _strict_retry = False  # track whether we used the strict=False fallback
-
     try:
-        # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
-        # write a leading BOM; json.load under plain utf-8 raises
-        # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
-        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
-    except json.JSONDecodeError:
-        # Retry with strict=False to handle bare control chars in string values
-        _strict_retry = True
-        try:
-            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
-                data = json.loads(f.read(), strict=False)
-        except Exception as e:
-            logger.error("Failed to auto-repair jobs.json: %s", e)
-            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
-    except IOError as e:
-        logger.error("IOError reading jobs.json: %s", e)
-        raise RuntimeError(f"Failed to read cron database: {e}") from e
+        snapshot, jobs = _read_validated_jobs_snapshot(jobs_file)
+    except RuntimeError as exc:
+        logger.error("Failed to load jobs.json: %s", exc)
+        raise
 
-    # Validate the top-level JSON shape: accept a dict (expected) or a bare
-    # list (auto-repair). Anything else (str/number/null) is corruption that
-    # would otherwise raise an uncaught AttributeError on ``.get()`` and take
-    # down the whole cron subsystem.
-    if isinstance(data, dict):
-        jobs = data.get("jobs", [])
-        if _strict_retry and jobs:
-            # Hit control-character corruption — rewrite with proper escaping.
-            save_jobs(jobs)
-            logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        _record_load_stamp(jobs_file, jobs)
-        return jobs
-    if isinstance(data, list):
-        # Bare array — likely saved/edited outside save_jobs(). Wrap it back
-        # into the expected {"jobs": [...]} structure.
-        if data:
-            save_jobs(data)
-            logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        _record_load_stamp(jobs_file, data)
-        return data
-
-    raise RuntimeError(
-        f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
-    )
-
-
-def _reconcile_degraded_write(
-    jobs_file: Path, jobs: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """Recover jobs a sibling process wrote since this critical section loaded.
-
-    When the cross-process flock in _jobs_lock() times out or is unavailable
-    (#60703), two processes can run a load->modify->save cycle concurrently
-    with no mutual exclusion. If a sibling process created a job in that
-    window, this critical section never saw it, and a plain overwrite would
-    silently discard it — the exact symptom in #80624 (CLI-created jobs
-    vanishing from jobs.json while the gateway is running).
-
-    Runs on every save, not just ones this process saw as degraded: a
-    *healthy* lock holder can still clobber a sibling's degraded write if
-    that sibling raced in and out while this process's own (properly
-    exclusive) critical section was open — the flock only stops other
-    processes from *also* getting exclusive access, it does nothing to stop
-    a process that gave up on getting it. The stat check below is a single
-    cheap syscall that is always a no-op when nothing raced (the overwhelming
-    common case), so this costs nothing on the healthy path. Any job ID
-    present on disk right now but absent from both what we loaded and what
-    we're about to write is unioned back in — favoring a resurrected job over
-    a silently lost one, matching the liveness-over-strict-consistency
-    tradeoff #60703 already accepted for this lock.
-    """
-    load_stamp = getattr(_jobs_lock_state, "load_stamp", None)
-    load_ids = getattr(_jobs_lock_state, "load_ids", None)
-    if load_ids is None:
-        return jobs
-    try:
-        st = jobs_file.stat()
-        current_stamp = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        current_stamp = None
-    if current_stamp == load_stamp:
-        return jobs
-    try:
-        current_jobs = load_jobs()
-    except RuntimeError:
-        return jobs
-    result_ids = {j["id"] for j in jobs if isinstance(j, dict) and "id" in j}
-    recovered = [
-        j
-        for j in current_jobs
-        if isinstance(j, dict)
-        and j.get("id") not in load_ids
-        and j.get("id") not in result_ids
-    ]
-    if recovered:
-        logger.error(
-            "jobs.json changed on disk since this process loaded it — "
-            "recovering %d job(s) a sibling process wrote that this write "
-            "would otherwise have discarded (#80624): %s",
-            len(recovered),
-            [j.get("id") for j in recovered],
-        )
-        jobs = jobs + recovered
+    _record_load_snapshot(jobs)
+    if _snapshot_repair_reason(snapshot) is not None:
+        # A public load may not hold _jobs_lock. Reacquire it and re-read: the
+        # generation that requested repair can already have been replaced by
+        # a sibling, and blindly saving the stale decoded list would erase it.
+        return _repair_jobs_snapshot(jobs_file)
     return jobs
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
+_MISSING_JOB = object()
+
+
+def _valid_job_id(job: Any) -> Optional[str]:
+    """Return an identity usable for record-level merge, else ``None``."""
+    if not isinstance(job, dict):
+        return None
+    job_id = job.get("id")
+    return job_id if isinstance(job_id, str) and job_id else None
+
+
+def _poisoned_job_ids(*snapshots: List[Dict[str, Any]]) -> Set[str]:
+    """Return IDs duplicated within any one B/D/C snapshot.
+
+    A duplicate cannot safely identify either record. Poisoning that ID across
+    all three views keeps the entire duplicate group in one conflict domain
+    instead of silently coalescing it in a dictionary.
+    """
+    poisoned = set()
+    for snapshot in snapshots:
+        seen = set()
+        for job in snapshot:
+            job_id = _valid_job_id(job)
+            if job_id is None:
+                continue
+            if job_id in seen:
+                poisoned.add(job_id)
+            seen.add(job_id)
+    return poisoned
+
+
+def _partition_jobs_for_merge(
+    jobs: List[Dict[str, Any]], poisoned_ids: Set[str]
+) -> Tuple[List[str], Dict[str, Dict[str, Any]], List[Any]]:
+    """Partition jobs into uniquely identified records and an opaque bag."""
+    order = []
+    identified = {}
+    unidentifiable = []
+    for job in jobs:
+        job_id = _valid_job_id(job)
+        if job_id is None or job_id in poisoned_ids:
+            unidentifiable.append(job)
+            continue
+        order.append(job_id)
+        identified[job_id] = job
+    return order, identified, unidentifiable
+
+
+def _job_order_signature(
+    jobs: List[Dict[str, Any]], poisoned_ids: Set[str], bag_namespace: str
+) -> List[Any]:
+    """Represent identified IDs and ordered opaque occurrences for comparison."""
+    signature = []
+    bag_index = 0
+    for job in jobs:
+        job_id = _valid_job_id(job)
+        if job_id is None or job_id in poisoned_ids:
+            signature.append(("bag", bag_namespace, bag_index))
+            bag_index += 1
+        else:
+            signature.append(("id", job_id))
+    return signature
+
+
+def _relative_job_order_changed(base_order: List[Any], side_order: List[Any]) -> bool:
+    """Return whether one side reordered tokens that exist in both snapshots."""
+    common_tokens = set(base_order) & set(side_order)
+    return [token for token in base_order if token in common_tokens] != [
+        token for token in side_order if token in common_tokens
+    ]
+
+
+def _sequence_can_overlay_on_other_skeleton(
+    base_order: List[Any], side_order: List[Any]
+) -> bool:
+    """Allow only deletions and suffix additions on another side's skeleton."""
+    if _relative_job_order_changed(base_order, side_order):
+        return False
+    base_tokens = set(base_order)
+    saw_addition = False
+    for token in side_order:
+        if token not in base_tokens:
+            saw_addition = True
+        elif saw_addition:
+            # Reassembly appends IDs missing from the chosen skeleton. An
+            # insertion before a surviving base token would lose its position.
+            return False
+    return True
+
+
+def _merge_jobs_three_way(
+    base: List[Dict[str, Any]],
+    desired: List[Dict[str, Any]],
+    current: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge caller D and latest C against loaded B without mutating inputs."""
+    # Preserve the exact winning snapshot—including its source order—when one
+    # side did not change or both sides made the same change. Besides avoiding
+    # needless partitioning, this retains the legacy tolerance for malformed
+    # records in the uncontested cases.
+    if desired == base:
+        return copy.deepcopy(current)
+    if current == base:
+        return copy.deepcopy(desired)
+    if desired == current:
+        return copy.deepcopy(desired)
+
+    # Missing/invalid IDs, non-object legacy rows, and every member of a
+    # duplicate-ID group cannot be matched record-by-record. Treat them as one
+    # opaque ordered bag and apply the same B/D/C rules to that whole bag. This
+    # lets an in-place legacy repair coexist with a sibling change elsewhere,
+    # while divergent edits inside the ambiguous bag still fail closed.
+    poisoned_ids = _poisoned_job_ids(base, desired, current)
+    base_order, base_by_id, base_bag = _partition_jobs_for_merge(
+        base, poisoned_ids
+    )
+    desired_order, desired_by_id, desired_bag = _partition_jobs_for_merge(
+        desired, poisoned_ids
+    )
+    current_order, current_by_id, current_bag = _partition_jobs_for_merge(
+        current, poisoned_ids
+    )
+
+    chosen = {}
+    all_ids = dict.fromkeys(base_order + desired_order + current_order)
+    for job_id in all_ids:
+        base_job = base_by_id.get(job_id, _MISSING_JOB)
+        desired_job = desired_by_id.get(job_id, _MISSING_JOB)
+        current_job = current_by_id.get(job_id, _MISSING_JOB)
+        if desired_job == base_job:
+            merged_job = current_job
+        elif current_job == base_job:
+            merged_job = desired_job
+        elif desired_job == current_job:
+            merged_job = desired_job
+        else:
+            raise RuntimeError(
+                "Refusing to save conflicting concurrent cron job change for "
+                f"id {job_id!r}"
+            )
+        chosen[job_id] = merged_job
+
+    # Order is part of the persisted snapshot contract here. An order-only
+    # change inside the opaque bag cannot be attributed to individual rows, so
+    # use ordinary list equality and retain the selected source bag verbatim.
+    if desired_bag == base_bag:
+        merged_bag = current_bag
+        bag_order_source = current if current_bag != base_bag else None
+    elif current_bag == base_bag:
+        merged_bag = desired_bag
+        bag_order_source = desired
+    else:
+        raise RuntimeError(
+            "Refusing to save conflicting concurrent unidentifiable cron job "
+            "changes"
+        )
+
+    base_signature = _job_order_signature(base, poisoned_ids, "base")
+    desired_signature = _job_order_signature(
+        desired,
+        poisoned_ids,
+        "base" if desired_bag == base_bag else "desired",
+    )
+    current_signature = _job_order_signature(
+        current,
+        poisoned_ids,
+        "base" if current_bag == base_bag else "current",
+    )
+    desired_sequence_changed = desired_signature != base_signature
+    current_sequence_changed = current_signature != base_signature
+    desired_overlay_safe = _sequence_can_overlay_on_other_skeleton(
+        base_signature, desired_signature
+    )
+    current_overlay_safe = _sequence_can_overlay_on_other_skeleton(
+        base_signature, current_signature
+    )
+
+    # Reassembly needs one full-list ordering skeleton. Deletions and suffix
+    # additions from the other side can be overlaid by skipping/appending the
+    # chosen IDs. A mid-list insertion or reorder cannot be moved to the end
+    # silently. A changed opaque bag forces its owning side's skeleton; without
+    # one, prefer the side on which the other sequence can be overlaid safely.
+    if bag_order_source is current:
+        if desired_sequence_changed and not desired_overlay_safe:
+            raise RuntimeError(
+                "Refusing to save concurrent cron job ordering and "
+                "unidentifiable-record changes"
+            )
+        order_source = current
+    elif bag_order_source is desired:
+        if current_sequence_changed and not current_overlay_safe:
+            raise RuntimeError(
+                "Refusing to save concurrent cron job ordering and "
+                "unidentifiable-record changes"
+            )
+        order_source = desired
+    elif desired_signature == current_signature:
+        order_source = desired
+    elif desired_sequence_changed and current_sequence_changed:
+        if current_overlay_safe:
+            order_source = desired
+        elif desired_overlay_safe:
+            order_source = current
+        else:
+            raise RuntimeError(
+                "Refusing to save conflicting concurrent cron job ordering changes"
+            )
+    elif desired_sequence_changed and not current_sequence_changed:
+        order_source = desired
+    elif current_sequence_changed and not desired_sequence_changed:
+        order_source = current
+    else:
+        order_source = desired
+
+    _, _, order_source_bag = _partition_jobs_for_merge(
+        order_source, poisoned_ids
+    )
+    if order_source_bag != merged_bag:
+        raise RuntimeError(
+            "Refusing to save cron jobs without a coherent ordering for "
+            "unidentifiable records"
+        )
+
+    result = []
+    emitted = set()
+    for job in order_source:
+        job_id = _valid_job_id(job)
+        if job_id is None or job_id in poisoned_ids:
+            result.append(copy.deepcopy(job))
+            continue
+        emitted.add(job_id)
+        merged_job = chosen[job_id]
+        if merged_job is not _MISSING_JOB:
+            result.append(copy.deepcopy(merged_job))
+    for job_id in desired_order + current_order + base_order:
+        if job_id in emitted:
+            continue
+        emitted.add(job_id)
+        merged_job = chosen[job_id]
+        if merged_job is not _MISSING_JOB:
+            result.append(copy.deepcopy(merged_job))
+    if merged_bag:
+        logger.warning(
+            "Reconciled jobs.json while preserving %d unidentifiable or "
+            "duplicate-ID record(s) as one conflict domain",
+            len(merged_bag),
+        )
+    return result
+
+
+def _save_jobs_unlocked(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Save jobs while preserving a loaded B, or explicitly replacing without B.
+
+    A call with no preceding load in this lock is an intentional whole-snapshot
+    recovery operation. It captures only the current path generation (so
+    corrupt or unreadable content can be replaced), then performs the same
+    staged generation recheck.
+    """
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
-    jobs = _reconcile_degraded_write(jobs_file, jobs)
-    # Snapshot the current owner BEFORE the atomic replace so a privileged
-    # writer (root CLI in Docker) can hand ownership back to the gateway user
-    # afterwards instead of locking its ticker out (#68483). When the file is
-    # being created for the first time, inherit the cron dir's owner — in the
-    # Docker image that is the PUID/PGID gateway user who must be able to
-    # read the store on the next tick.
-    try:
-        _stat_before = os.stat(jobs_file)
-    except OSError:
-        try:
-            _stat_before = os.stat(jobs_file.parent)
-        except OSError:
-            _stat_before = None
-    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        atomic_replace(tmp_path, jobs_file)
-        _secure_file(jobs_file)
-        _preserve_file_ownership(jobs_file, _stat_before)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    desired_jobs = copy.deepcopy(jobs)
+    loaded_jobs = getattr(_jobs_lock_state, "load_jobs", None)
+    base_jobs = copy.deepcopy(loaded_jobs) if loaded_jobs is not None else None
+    with _jobs_commit_lock() as validate_commit_lock:
+        for attempt in range(1, _JOBS_GENERATION_MAX_ATTEMPTS + 1):
+            if base_jobs is None:
+                try:
+                    observed_stamp = _jobs_file_stamp(jobs_file)
+                except OSError as exc:
+                    raise RuntimeError(f"Failed to read cron database: {exc}") from exc
+                reconciled_jobs = copy.deepcopy(desired_jobs)
+            else:
+                current_snapshot, current_jobs = _read_validated_jobs_snapshot(
+                    jobs_file
+                )
+                reconciled_jobs = _merge_jobs_three_way(
+                    base_jobs, desired_jobs, current_jobs
+                )
+                observed_stamp = current_snapshot.stamp
+            # Snapshot the current owner BEFORE the atomic replace so a
+            # privileged writer (root CLI in Docker) can hand ownership back
+            # to the gateway user afterwards instead of locking its ticker out
+            # (#68483). When creating the file, inherit the cron dir's owner.
+            try:
+                stat_before = os.stat(jobs_file)
+            except OSError:
+                try:
+                    stat_before = os.stat(jobs_file.parent)
+                except OSError:
+                    stat_before = None
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
+            )
+            published = False
+            raw_fd = fd
+            try:
+                if os.name == "posix":
+                    os.fchmod(raw_fd, 0o600)
+                file_obj = os.fdopen(raw_fd, "w", encoding="utf-8")
+                raw_fd = -1
+                with file_obj as f:
+                    json.dump(
+                        {
+                            "jobs": reconciled_jobs,
+                            "updated_at": _hermes_now().isoformat(),
+                        },
+                        f,
+                        indent=2,
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                if _jobs_file_stamp(jobs_file) != observed_stamp:
+                    logger.warning(
+                        "jobs.json changed while this process staged its save; "
+                        "re-reading and reconciling before publish (attempt %d/%d)",
+                        attempt,
+                        _JOBS_GENERATION_MAX_ATTEMPTS,
+                    )
+                    continue
+
+                # The commit-lock pathname can be renamed/recreated after its
+                # initial validation, splitting cooperating writers across two
+                # lock inodes. Revalidate at the publication boundary.
+                validate_commit_lock()
+                published_path = Path(atomic_replace(tmp_path, jobs_file))
+                published = True
+                # mkstemp/fchmod secures the normal rename path. Re-apply mode
+                # to cover atomic_replace's EXDEV/EBUSY copy fallback too.
+                _secure_file(published_path)
+                _preserve_file_ownership(published_path, stat_before)
+                if getattr(_jobs_lock_state, "depth", 0):
+                    # Preserve the caller's view D, not merged C'. A recovered
+                    # C-only create/delete must remain external provenance on
+                    # a second save within the same outer mutation lock.
+                    _jobs_lock_state.load_jobs = copy.deepcopy(desired_jobs)
+                return copy.deepcopy(reconciled_jobs)
+            finally:
+                if raw_fd >= 0:
+                    try:
+                        os.close(raw_fd)
+                    except OSError:
+                        pass
+                if not published:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+    raise RuntimeError(
+        "jobs.json kept changing while this process prepared a save; "
+        "refusing to overwrite concurrent updates"
+    )
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def save_jobs(jobs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Save all jobs and return the exact reconciled snapshot published."""
     with _jobs_lock():
-        _save_jobs_unlocked(jobs)
+        return _save_jobs_unlocked(jobs)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -2216,6 +2761,8 @@ def _sweep_completed_oneshots(raw_jobs: List[Dict[str, Any]], now: datetime) -> 
     cutoff = now - timedelta(days=retention_days)
     removed = False
     for rj in list(raw_jobs):
+        if not isinstance(rj, dict):
+            continue
         try:
             if rj.get("state") != "completed":
                 continue
@@ -2250,6 +2797,78 @@ def _sweep_completed_oneshots(raw_jobs: List[Dict[str, Any]], now: datetime) -> 
     return removed
 
 
+def _unique_jobs_by_id(
+    raw_jobs: List[Any], wanted_ids: Set[str]
+) -> Dict[str, Dict[str, Any]]:
+    """Index only wanted IDs that occur exactly once in a raw snapshot."""
+    indexed = {}
+    ambiguous_ids = set()
+    for job in raw_jobs:
+        job_id = _valid_job_id(job)
+        if job_id is None or job_id not in wanted_ids:
+            continue
+        if job_id in indexed:
+            ambiguous_ids.add(job_id)
+        else:
+            indexed[job_id] = job
+    for job_id in ambiguous_ids:
+        indexed.pop(job_id, None)
+    return indexed
+
+
+def _revalidate_due_jobs(
+    due: List[Dict[str, Any]],
+    expected_jobs: List[Any],
+    authoritative_jobs: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Fail closed when a due record changed before the dispatch boundary.
+
+    A successful save supplies the exact reconciled snapshot it published, so
+    its one-shot run_claim cannot be stranded by an unnecessary second lock or
+    read failure. Without a save, the commit lock makes the final read
+    authoritative against cooperating publishers. Either boundary necessarily
+    ends before the caller can dispatch, so a later pause remains an
+    API-boundary race; closing that gap would require a durable claim for
+    recurring jobs, not a broader file lock.
+    """
+    wanted_ids = {
+        job_id for job in due if (job_id := _valid_job_id(job)) is not None
+    }
+    expected_by_id = _unique_jobs_by_id(expected_jobs, wanted_ids)
+    if authoritative_jobs is None:
+        jobs_file = _current_cron_store().jobs_file
+        with _jobs_commit_lock() as validate_commit_lock:
+            _snapshot, authoritative_jobs = _read_validated_jobs_snapshot(jobs_file)
+            validate_commit_lock()
+    authoritative_by_id = _unique_jobs_by_id(authoritative_jobs, wanted_ids)
+
+    validated_due = []
+    emitted_ids = set()
+    for job in due:
+        job_id = _valid_job_id(job)
+        expected_job = expected_by_id.get(job_id) if job_id is not None else None
+        authoritative_job = (
+            authoritative_by_id.get(job_id) if job_id is not None else None
+        )
+        if (
+            job_id is None
+            or job_id in emitted_ids
+            or expected_job is None
+            or authoritative_job is None
+            or authoritative_job != expected_job
+            or not authoritative_job.get("enabled", True)
+        ):
+            logger.warning(
+                "Skipping due cron job %r because its authoritative record "
+                "changed before dispatch",
+                job_id or "?",
+            )
+            continue
+        emitted_ids.add(job_id)
+        validated_due.append(job)
+    return validated_due
+
+
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
@@ -2274,22 +2893,64 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     raw_jobs = load_jobs()
     needs_save = False
 
-    # Repair id-less records BEFORE anything keys off ``job["id"]``. A direct
-    # jobs.json edit that bypassed add_job() can leave a record without an "id"
-    # (older writers used "job_id"). Every downstream site — the logging
-    # helpers and the ``for rj in raw_jobs: if rj["id"] == job["id"]``
-    # persistence loops — indexes job["id"] eagerly, so a single malformed
-    # record raised KeyError mid-tick, aborting the whole scan before
-    # save_jobs() ran. That froze the entire profile's scheduler in a
-    # per-minute fast-forward loop (healthy jobs recomputed in memory, then
-    # discarded when the exception unwound). Recover the id from the drifted
-    # "job_id" key when present, else synthesize one, and persist.
-    for rj in raw_jobs:
-        if not rj.get("id"):
-            rj["id"] = rj.pop("job_id", None) or uuid.uuid4().hex[:12]
-            needs_save = True
+    opaque_count = sum(not isinstance(rj, dict) for rj in raw_jobs)
+    if opaque_count:
+        logger.warning(
+            "Skipping %d non-object cron job record(s) during due scan; "
+            "preserving them unchanged in jobs.json",
+            opaque_count,
+        )
 
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
+    # Repair missing/invalid/duplicate identities BEFORE anything keys off
+    # ``job["id"]``. Direct jobs.json edits and older writers can leave an
+    # id-less ``job_id`` record; duplicate IDs are equally unsafe because every
+    # persistence loop updates the first matching row. Keep the first valid ID,
+    # give every later collision a fresh one, and persist the unambiguous view.
+    reserved_ids = {
+        job_id
+        for rj in raw_jobs
+        if (job_id := _valid_job_id(rj)) is not None
+    }
+    seen_ids = set()
+    for rj in raw_jobs:
+        if not isinstance(rj, dict):
+            continue
+        job_id = _valid_job_id(rj)
+        if job_id is not None and job_id not in seen_ids:
+            seen_ids.add(job_id)
+            continue
+
+        legacy_id = rj.get("job_id") if job_id is None else None
+        if (
+            isinstance(legacy_id, str)
+            and legacy_id
+            and legacy_id not in reserved_ids
+        ):
+            replacement_id = legacy_id
+        else:
+            replacement_id = None
+            for _attempt in range(_JOB_ID_REPAIR_MAX_ATTEMPTS):
+                candidate_id = uuid.uuid4().hex[:12]
+                if candidate_id not in reserved_ids:
+                    replacement_id = candidate_id
+                    break
+            if replacement_id is None:
+                raise RuntimeError(
+                    "Could not generate a unique ID while repairing cron jobs; "
+                    "refusing to persist ambiguous records"
+                )
+        if job_id is None:
+            rj.pop("job_id", None)
+        rj["id"] = replacement_id
+        reserved_ids.add(replacement_id)
+        seen_ids.add(replacement_id)
+        needs_save = True
+
+    jobs = [
+        _apply_skill_fields(j)
+        for j in copy.deepcopy(raw_jobs)
+        if isinstance(j, dict)
+    ]
     due = []
 
     # Normalize malformed "schedule" records (direct jobs.json edit, old writers,
@@ -2305,6 +2966,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             j["schedule"] = {}
             needs_save = True
     for rj in raw_jobs:
+        if not isinstance(rj, dict):
+            continue
         if not isinstance(rj.get("schedule"), dict):
             rj["schedule"] = {}
             needs_save = True
@@ -2329,6 +2992,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     j.pop("next_run_at", None)
                     needs_save = True
     for rj in raw_jobs:
+        if not isinstance(rj, dict):
+            continue
         nr = rj.get("next_run_at")
         if nr is not None:
             if not isinstance(nr, str):
@@ -2354,6 +3019,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 j.pop("last_run_at", None)
                 needs_save = True
     for rj in raw_jobs:
+        if not isinstance(rj, dict):
+            continue
         lr = rj.get("last_run_at")
         if lr is not None and not isinstance(lr, str):
             rj.pop("last_run_at", None)
@@ -2376,7 +3043,14 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
     # window each scan.
     if _sweep_completed_oneshots(raw_jobs, now):
         needs_save = True
-        jobs = [j for j in jobs if any(rj.get("id") == j.get("id") for rj in raw_jobs)]
+        jobs = [
+            j
+            for j in jobs
+            if any(
+                isinstance(rj, dict) and rj.get("id") == j.get("id")
+                for rj in raw_jobs
+            )
+        ]
 
     for job in jobs:
         # Per-job containment (structural guard): one malformed or
@@ -2446,7 +3120,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     recovered_next,
                 )
                 for rj in raw_jobs:
-                    if rj["id"] == job["id"]:
+                    if isinstance(rj, dict) and rj.get("id") == job["id"]:
                         rj["next_run_at"] = recovered_next
                         needs_save = True
                         break
@@ -2488,7 +3162,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         new_next,
                     )
                     for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
+                        if isinstance(rj, dict) and rj.get("id") == job["id"]:
                             rj["next_run_at"] = new_next
                             needs_save = True
                             break
@@ -2524,7 +3198,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                         # advance_next_run. mark_job_run re-anchors next_run_at off
                         # the actual completion time, so this value is provisional.
                         for rj in raw_jobs:
-                            if rj["id"] == job["id"]:
+                            if (
+                                isinstance(rj, dict)
+                                and rj.get("id") == job["id"]
+                            ):
                                 rj["next_run_at"] = new_next
                                 needs_save = True
                                 break
@@ -2569,7 +3246,10 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 times,
                             )
                             for rj in raw_jobs:
-                                if rj["id"] == job["id"]:
+                                if (
+                                    isinstance(rj, dict)
+                                    and rj.get("id") == job["id"]
+                                ):
                                     raw_jobs.remove(rj)
                                     needs_save = True
                                     break
@@ -2600,7 +3280,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     claim = {"at": now.isoformat(), "by": _machine_id()}
                     job["run_claim"] = claim
                     for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
+                        if isinstance(rj, dict) and rj.get("id") == job["id"]:
                             rj["run_claim"] = claim
                             needs_save = True
                             break
@@ -2613,10 +3293,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             )
             continue
 
-    if needs_save:
-        save_jobs(raw_jobs)
+    authoritative_jobs = save_jobs(raw_jobs) if needs_save else None
 
-    return due
+    return (
+        _revalidate_due_jobs(due, raw_jobs, authoritative_jobs)
+        if due
+        else due
+    )
 
 
 # Per-run cron output (`cron/output/<job>/<timestamp>.md`) is written once per
