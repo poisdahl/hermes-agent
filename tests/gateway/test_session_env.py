@@ -40,6 +40,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
         chat_name="Group",
         chat_type="group",
         user_id="123456",
+        user_id_alt="union-123",
         user_name="alice",
         thread_id="17585",
     )
@@ -51,6 +52,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
 
@@ -63,6 +65,7 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == "Group"
     assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == "union-123"
     assert get_session_env("HERMES_SESSION_USER_NAME") == "alice"
     assert get_session_env("HERMES_SESSION_THREAD_ID") == "17585"
 
@@ -85,6 +88,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_CHAT_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_ID", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_USER_ID_ALT", raising=False)
     monkeypatch.delenv("HERMES_SESSION_USER_NAME", raising=False)
     monkeypatch.delenv("HERMES_SESSION_THREAD_ID", raising=False)
 
@@ -94,6 +98,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
         chat_name="Group",
         chat_type="group",
         user_id="123456",
+        user_id_alt="union-123",
         user_name="alice",
         thread_id="17585",
     )
@@ -102,6 +107,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_PLATFORM") == "telegram"
     assert get_session_env("HERMES_SESSION_USER_ID") == "123456"
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == "union-123"
     assert get_session_env("HERMES_SESSION_CHAT_TYPE") == "group"
 
     runner._clear_session_env(tokens)
@@ -112,6 +118,7 @@ def test_clear_session_env_restores_previous_state(monkeypatch):
     assert get_session_env("HERMES_SESSION_CHAT_NAME") == ""
     assert get_session_env("HERMES_SESSION_CHAT_TYPE") == ""
     assert get_session_env("HERMES_SESSION_USER_ID") == ""
+    assert get_session_env("HERMES_SESSION_USER_ID_ALT") == ""
     assert get_session_env("HERMES_SESSION_USER_NAME") == ""
     assert get_session_env("HERMES_SESSION_THREAD_ID") == ""
 
@@ -272,4 +279,3 @@ def test_cron_session_set_clear_and_reset_tristate(monkeypatch):
 
     reset_session_vars()
     assert get_session_env("HERMES_CRON_SESSION") == "1"
-

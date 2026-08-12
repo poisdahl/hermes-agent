@@ -4133,19 +4133,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chat_id: str,
         thread_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        user_id_alt: Optional[str] = None,
     ) -> Optional[str]:
         """Find the most recent live session_id for a platform + chat origin.
 
         Equivalent of gateway/mirror's sessions.json scan: matches on
-        source + chat_id (+ thread_id when provided).  When ``user_id`` is
-        provided, exact sender matches are preferred; if multiple distinct
-        users share the chat and none matches, returns None rather than
-        contaminating another participant's session.
+        source + chat_id (+ thread_id when provided). Sender matching uses the
+        same canonical identity as gateway session keying:
+        ``user_id_alt or user_id``. If multiple distinct users share the chat
+        and none matches, returns None rather than contaminating another
+        participant's session.
         """
         if not platform or chat_id in (None, ""):
             return None
         query = """
-            SELECT id, user_id, started_at FROM sessions
+            SELECT id, user_id, origin_json, started_at FROM sessions
             WHERE LOWER(source) = LOWER(?)
               AND session_key IS NOT NULL
               AND chat_id = ?
@@ -4160,17 +4162,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             rows = [dict(r) for r in self._conn.execute(query, params).fetchall()]
         if not rows:
             return None
-        if user_id:
-            exact = [r for r in rows if str(r.get("user_id") or "") == str(user_id)]
+        def _canonical_user(row: dict) -> str:
+            try:
+                origin = json.loads(row.get("origin_json") or "")
+            except (TypeError, ValueError):
+                origin = {}
+            if not isinstance(origin, dict):
+                origin = {}
+            identity = (
+                origin.get("user_id_alt")
+                or row.get("user_id")
+                or ""
+            )
+            return str(identity)
+
+        requested_user = str(user_id_alt or user_id or "")
+        if requested_user:
+            exact = [r for r in rows if _canonical_user(r) == requested_user]
             if exact:
                 return str(exact[0]["id"])
-            if len(rows) > 1:
+            if user_id_alt or len(rows) > 1:
                 return None
         elif len(rows) > 1:
             distinct_users = {
-                str(r.get("user_id") or "").strip()
+                _canonical_user(r)
                 for r in rows
-                if str(r.get("user_id") or "").strip()
+                if _canonical_user(r)
             }
             if len(distinct_users) > 1:
                 return None

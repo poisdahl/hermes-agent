@@ -459,6 +459,8 @@ class TestLocalDeliveryNotice:
             "HERMES_SESSION_CHAT_ID",
             "HERMES_SESSION_THREAD_ID",
             "HERMES_SESSION_CHAT_NAME",
+            "HERMES_SESSION_USER_ID",
+            "HERMES_SESSION_USER_ID_ALT",
         ):
             monkeypatch.delenv(var, raising=False)
         from gateway.session_context import clear_session_vars, set_session_vars
@@ -483,12 +485,26 @@ class TestLocalDeliveryNotice:
         # resolves to that chat — nothing to warn about.
         from gateway.session_context import set_session_vars
 
-        set_session_vars(platform="telegram", chat_id="999")
+        set_session_vars(
+            platform="signal",
+            chat_id="group-1",
+            user_id="shared",
+            user_id_alt="uuid-alice",
+        )
         created = json.loads(
             cronjob(action="create", prompt="x", schedule="every 2m")
         )
         assert created["deliver"] == "origin"
         assert "local-only cron job" not in created["message"]
+        from cron.jobs import get_job
+        assert get_job(created["job_id"])["origin"] == {
+            "platform": "signal",
+            "chat_id": "group-1",
+            "chat_name": None,
+            "thread_id": None,
+            "user_id": "shared",
+            "user_id_alt": "uuid-alice",
+        }
 
 
 class TestValidateCronBaseUrl:

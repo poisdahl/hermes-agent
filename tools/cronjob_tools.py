@@ -332,9 +332,10 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
             # Captured so an opt-in delivery mirror (cron.mirror_delivery /
             # attach_to_session) can resolve the exact participant's session in
             # per-user-isolated group chats — parity with interactive
-            # send_message, which passes HERMES_SESSION_USER_ID to
+            # send_message, which passes both identity forms to
             # gateway.mirror.mirror_to_session. Harmless for DMs/shared sessions.
             "user_id": get_session_env("HERMES_SESSION_USER_ID") or None,
+            "user_id_alt": get_session_env("HERMES_SESSION_USER_ID_ALT") or None,
         }
     return None
 

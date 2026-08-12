@@ -30,6 +30,8 @@ def mirror_to_session(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     role: str = "assistant",
+    *,
+    user_id_alt: Optional[str] = None,
 ) -> bool:
     """
     Append a delivery-mirror message to the target session's transcript.
@@ -57,14 +59,16 @@ def mirror_to_session(
             str(chat_id),
             thread_id=thread_id,
             user_id=user_id,
+            user_id_alt=user_id_alt,
         )
         if not session_id:
             logger.debug(
-                "Mirror: no session found for %s:%s:%s:%s",
+                "Mirror: no session found for %s:%s:%s:%s:%s",
                 platform,
                 chat_id,
                 thread_id,
                 user_id,
+                user_id_alt,
             )
             return False
 
@@ -83,11 +87,12 @@ def mirror_to_session(
 
     except Exception as e:
         logger.debug(
-            "Mirror failed for %s:%s:%s:%s: %s",
+            "Mirror failed for %s:%s:%s:%s:%s: %s",
             platform,
             chat_id,
             thread_id,
             user_id,
+            user_id_alt,
             e,
         )
         return False
@@ -98,6 +103,7 @@ def _find_session_id(
     chat_id: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
 ) -> Optional[str]:
     """
     Find the active session_id for a platform + chat_id pair.
@@ -107,9 +113,9 @@ def _find_session_id(
     DM session keys don't embed the chat_id (e.g. "agent:main:telegram:dm"),
     so we match on the persisted chat origin, not the key.
 
-    When *user_id* is provided, prefer exact sender matches. If multiple
-    same-chat candidates exist and none matches the user, return None instead
-    of guessing and contaminating another participant's session.
+    Sender matching uses the same canonical identity as session keying:
+    ``user_id_alt or user_id``. If multiple same-chat candidates exist and
+    none matches that identity, return None instead of guessing.
     """
     # Primary: state.db
     try:
@@ -123,6 +129,7 @@ def _find_session_id(
                     chat_id=chat_id,
                     thread_id=thread_id,
                     user_id=user_id,
+                    user_id_alt=user_id_alt,
                 )
                 if session_id:
                     return str(session_id)
@@ -165,20 +172,26 @@ def _find_session_id(
     if not candidates:
         return None
 
-    if user_id:
+    requested_user = str(user_id_alt or user_id or "")
+
+    def _canonical_user(entry: dict) -> str:
+        origin = entry.get("origin") or {}
+        return str(origin.get("user_id_alt") or origin.get("user_id") or "")
+
+    if requested_user:
         exact_user_matches = [
             entry for entry in candidates
-            if str((entry.get("origin") or {}).get("user_id") or "") == str(user_id)
+            if _canonical_user(entry) == requested_user
         ]
         if exact_user_matches:
             candidates = exact_user_matches
-        elif len(candidates) > 1:
+        elif user_id_alt or len(candidates) > 1:
             return None
     elif len(candidates) > 1:
         distinct_user_ids = {
-            str((entry.get("origin") or {}).get("user_id") or "").strip()
+            _canonical_user(entry)
             for entry in candidates
-            if str((entry.get("origin") or {}).get("user_id") or "").strip()
+            if _canonical_user(entry)
         }
         if len(distinct_user_ids) > 1:
             return None

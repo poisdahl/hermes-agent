@@ -75,6 +75,65 @@ class TestFindSessionId:
 
         assert result == "sess_topic_a"
 
+    def test_alt_id_uses_canonical_identity_in_legacy_index(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "alice": {
+                "session_id": "sess_alice",
+                "origin": {
+                    "platform": "signal", "chat_id": "group-1",
+                    "user_id": "shared", "user_id_alt": "uuid-alice",
+                },
+                "updated_at": "2026-01-01T00:00:00",
+            },
+            "bob": {
+                "session_id": "sess_bob",
+                "origin": {
+                    "platform": "signal", "chat_id": "group-1",
+                    "user_id": "shared", "user_id_alt": "uuid-bob",
+                },
+                "updated_at": "2026-02-01T00:00:00",
+            },
+        })
+
+        with patch("hermes_state.SessionDB") as db_cls, \
+             patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            db_cls.return_value.find_session_by_origin.return_value = None
+            result = _find_session_id(
+                "signal", "group-1", user_id="shared", user_id_alt="uuid-alice"
+            )
+
+        assert result == "sess_alice"
+        db_cls.return_value.find_session_by_origin.assert_called_once_with(
+            platform="signal",
+            chat_id="group-1",
+            thread_id=None,
+            user_id="shared",
+            user_id_alt="uuid-alice",
+        )
+
+    def test_explicit_alt_mismatch_does_not_guess_single_session(self, tmp_path):
+        sessions_dir, index_file = _setup_sessions(tmp_path, {
+            "alice": {
+                "session_id": "sess_alice",
+                "origin": {
+                    "platform": "signal", "chat_id": "group-1",
+                    "user_id": "shared", "user_id_alt": "uuid-alice",
+                },
+                "updated_at": "2026-01-01T00:00:00",
+            },
+        })
+
+        with patch("hermes_state.SessionDB") as db_cls, \
+             patch.object(mirror_mod, "_SESSIONS_DIR", sessions_dir), \
+             patch.object(mirror_mod, "_SESSIONS_INDEX", index_file):
+            db_cls.return_value.find_session_by_origin.return_value = None
+            result = _find_session_id(
+                "signal", "group-1", user_id="shared", user_id_alt="uuid-bob"
+            )
+
+        assert result is None
+
 
 class TestMirrorToSession:
 
@@ -129,4 +188,3 @@ class TestAppendToSqlite:
 
         mock_db.append_message.assert_called_once()
         mock_db.close.assert_called_once()
-

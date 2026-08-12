@@ -1661,7 +1661,10 @@ class TestCronDeliveryMirror:
                 "id": "test-job",
                 "name": "daily-report",
                 "deliver": "origin",
-                "origin": {"platform": "telegram", "chat_id": "123"},
+                "origin": {
+                    "platform": "telegram", "chat_id": "123",
+                    "user_id": "shared", "user_id_alt": "uuid-alice",
+                },
                 "attach_to_session": True,
             }
             _deliver_result(job, "Here is today's summary.")
@@ -1672,6 +1675,8 @@ class TestCronDeliveryMirror:
         assert "Here is today's summary." in mirrored_text
         assert "Cronjob Response:" not in mirrored_text
         assert "To stop or manage this job" not in mirrored_text
+        assert mirror_mock.call_args.kwargs["user_id"] == "shared"
+        assert mirror_mock.call_args.kwargs["user_id_alt"] == "uuid-alice"
 
 
     # --- origin-scoping (mirror only into the conversation that created the job) ---
@@ -1839,7 +1844,8 @@ class TestCronContinuableSurfaceInChannel:
         with patch("gateway.mirror.mirror_to_session", return_value=True) as mirror_mock:
             ok = _seed_cron_channel_session(
                 {"id": "j1", "name": "Brief"}, adapter, "slack", "C123",
-                "Daily brief", is_dm=False, user_id="U_HUMAN", chat_name="ops",
+                "Daily brief", is_dm=False, user_id="shared",
+                user_id_alt="U_HUMAN", chat_name="ops",
             )
         assert ok is True
         seeded_source = store.get_or_create_session.call_args[0][0]
@@ -1849,7 +1855,7 @@ class TestCronContinuableSurfaceInChannel:
         # None) from the same user resolves to:
         inbound = SessionSource(
             platform=Platform.SLACK, chat_id="C123", chat_type="group",
-            user_id="U_HUMAN", thread_id=None,
+            user_id="shared", user_id_alt="U_HUMAN", thread_id=None,
         )
         assert seed_key == build_session_key(inbound), (
             f"seed key {seed_key} != inbound reply key {build_session_key(inbound)} "
@@ -1857,7 +1863,8 @@ class TestCronContinuableSurfaceInChannel:
         )
         mirror_mock.assert_called_once()
         assert mirror_mock.call_args.kwargs.get("thread_id") is None
-        assert mirror_mock.call_args.kwargs.get("user_id") == "U_HUMAN"
+        assert mirror_mock.call_args.kwargs.get("user_id") == "shared"
+        assert mirror_mock.call_args.kwargs.get("user_id_alt") == "U_HUMAN"
 
 
 class TestMultiTargetDeliveryContinuesOnFailure:
@@ -1974,5 +1981,4 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
 

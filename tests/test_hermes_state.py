@@ -3584,6 +3584,50 @@ def test_find_session_by_origin_matching_rules(db):
     ) is None
 
 
+def test_find_session_by_origin_uses_canonical_alt_identity(db):
+    for name in ("alice", "bob"):
+        db.create_session(
+            f"gw-{name}",
+            "signal",
+            user_id="shared",
+            session_key=f"agent:main:signal:group:g1:uuid-{name}",
+            chat_id="g1",
+            chat_type="group",
+            origin_json=json.dumps({
+                "platform": "signal",
+                "chat_id": "g1",
+                "user_id": "shared",
+                "user_id_alt": f"uuid-{name}",
+            }),
+        )
+
+    assert db.find_session_by_origin(
+        platform="signal",
+        chat_id="g1",
+        user_id="shared",
+        user_id_alt="uuid-alice",
+    ) == "gw-alice"
+    # A shared primary id is not an exact match when the session key is built
+    # from distinct alternate ids.
+    assert db.find_session_by_origin(
+        platform="signal", chat_id="g1", user_id="shared"
+    ) is None
+    assert db.find_session_by_origin(
+        platform="signal",
+        chat_id="g1",
+        user_id="shared",
+        user_id_alt="uuid-unknown",
+    ) is None
+
+    db.end_session("gw-bob", "session_reset")
+    assert db.find_session_by_origin(
+        platform="signal",
+        chat_id="g1",
+        user_id="shared",
+        user_id_alt="uuid-unknown",
+    ) is None
+
+
 
 
 

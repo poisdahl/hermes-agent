@@ -826,6 +826,7 @@ def _maybe_mirror_cron_delivery(
     mirror_text: str,
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    user_id_alt: Optional[str] = None,
     *,
     enabled: bool = False,
 ) -> None:
@@ -834,9 +835,10 @@ def _maybe_mirror_cron_delivery(
     No-op unless ``enabled`` (resolved once by the caller, and already scoped to
     the origin target — see ``_target_matches_origin``). Reuses the shipped
     ``mirror_to_session`` so cron rides exactly the same path that interactive
-    ``send_message`` mirroring already uses, including passing ``user_id`` so a
-    per-user-isolated group chat resolves to the exact member who scheduled the
-    job (parity with ``send_message``). All failures are swallowed — a delivery
+    ``send_message`` mirroring already uses, including passing the canonical
+    sender identity so a per-user-isolated group chat resolves to the exact
+    member who scheduled the job (parity with ``send_message``). All failures
+    are swallowed — a delivery
     that succeeded must never be reported as failed because the transcript
     mirror hit a problem.
 
@@ -869,6 +871,7 @@ def _maybe_mirror_cron_delivery(
             source_label="cron",
             thread_id=thread_id,
             user_id=user_id,
+            user_id_alt=user_id_alt,
             role="user",
         )
         if ok:
@@ -1022,6 +1025,7 @@ def _seed_cron_channel_session(
     *,
     is_dm: bool,
     user_id: Optional[str],
+    user_id_alt: Optional[str] = None,
     chat_name: Optional[str] = None,
 ) -> bool:
     """Seed the FLAT (thread_id=None) session for an ``in_channel`` cron delivery.
@@ -1044,9 +1048,10 @@ def _seed_cron_channel_session(
     The session KEY must match what the user's later inbound reply resolves to
     (``build_session_key``):
     - **Channel** (``chat_type="group"``): key is
-      ``…:group:<chat_id>:<user_id>`` — user-isolated — so the seed MUST carry
-      the **origin's real ``user_id``** (the member who scheduled the job), NOT
-      a synthetic ``system:cron`` id, or the reply keys to a different session.
+      ``…:group:<chat_id>:<participant_id>`` — user-isolated — so the seed MUST
+      carry the origin's canonical ``user_id_alt or user_id`` (the member who
+      scheduled the job), NOT a synthetic ``system:cron`` id, or the reply keys
+      to a different session.
     - **1:1 DM** (``chat_type="dm"``): the key is ``…:dm:<chat_id>`` and does
       NOT embed ``user_id``, so any ``user_id`` resolves to the same session.
     ``chat_type`` mirrors the inbound handler's own choice
@@ -1078,6 +1083,7 @@ def _seed_cron_channel_session(
                     chat_name=chat_name,
                     chat_type=chat_type,
                     user_id=str(user_id) if user_id else None,
+                    user_id_alt=str(user_id_alt) if user_id_alt else None,
                     thread_id=None,  # flat — the whole-channel/DM session
                 )
                 # Create the flat session row so the mirror has a target and the
@@ -1093,6 +1099,7 @@ def _seed_cron_channel_session(
             source_label="cron",
             thread_id=None,
             user_id=str(user_id) if user_id else None,
+            user_id_alt=str(user_id_alt) if user_id_alt else None,
             role="user",
         )
         if ok:
@@ -1766,9 +1773,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         mirror_this_target = mirror_enabled and _target_matches_origin(
             origin, platform_name, chat_id, thread_id
         )
-        # Pass the origin's user_id so a per-user-isolated group chat resolves to
-        # the exact member who scheduled the job — parity with send_message.
+        # Pass both identity forms so a per-user-isolated group chat resolves
+        # the same canonical participant as build_session_key.
         origin_user_id = origin.get("user_id") if mirror_this_target else None
+        origin_user_id_alt = origin.get("user_id_alt") if mirror_this_target else None
 
         # Built-in names resolve to their enum member; plugin platform names
         # create dynamic members via Platform._missing_().
@@ -2194,11 +2202,13 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             job, runtime_adapter, platform_name, chat_id,
                             mirror_text, is_dm=is_dm_target,
                             user_id=origin_user_id,
+                            user_id_alt=origin_user_id_alt,
                             chat_name=origin.get("chat_name"),
                         )
                     _maybe_mirror_cron_delivery(
                         job, platform_name, chat_id, mirror_text,
                         thread_id=thread_id, user_id=origin_user_id,
+                        user_id_alt=origin_user_id_alt,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
             except Exception as e:
@@ -2306,6 +2316,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
+                user_id_alt=origin_user_id_alt,
                 enabled=mirror_this_target and not thread_seeded,
             )
 
