@@ -2565,14 +2565,21 @@ class TestHandleMaxIterations:
     def test_summary_strips_strict_schema_foreign_fields(self, agent):
         """Regression: the max-iterations summary request must NOT carry
         Chat-Completions-schema-foreign keys — tool_name (SQLite FTS
-        bookkeeping), codex_* reasoning carriers, or internal _-prefixed
-        scaffolding. Strict gateways (Fireworks-backed OpenCode Go, Mistral,
-        Kimi) reject these with 'Extra inputs are not permitted, field:
-        messages[N].tool_name'. The transport's convert_messages() strips
-        them on the main loop; this hand-built summary path must mirror it."""
+        bookkeeping), codex_* reasoning carriers, display-only timeline
+        metadata, or internal _-prefixed scaffolding. Strict gateways
+        (Fireworks-backed OpenCode Go, Mistral, Kimi) reject these with
+        'Extra inputs are not permitted, field: messages[N].tool_name'. The
+        transport's convert_messages() strips them on the main loop; this
+        hand-built summary path must mirror it."""
         agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
         agent._cached_system_prompt = "You are helpful."
         messages = [
+            {
+                "role": "user",
+                "content": "[System: personality switched]",
+                "display_kind": "personality_switch",
+                "display_metadata": {"personality": "focused"},
+            },
             {"role": "user", "content": "do stuff"},
             {
                 "role": "assistant",
@@ -2591,10 +2598,18 @@ class TestHandleMaxIterations:
             assert "tool_name" not in m, m
             assert "codex_reasoning_items" not in m, m
             assert "codex_message_items" not in m, m
+            assert "display_kind" not in m, m
+            assert "display_metadata" not in m, m
             assert not any(isinstance(k, str) and k.startswith("_") for k in m), m
+        sent_user = next(m for m in sent_msgs if m.get("role") == "user")
+        assert sent_user["content"].startswith(
+            "[System: personality switched]\n\ndo stuff"
+        )
         # Internal history is untouched — the path copies each message.
-        assert messages[2]["tool_name"] == "execute_code"
-        assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
+        assert messages[0]["display_kind"] == "personality_switch"
+        assert messages[0]["display_metadata"] == {"personality": "focused"}
+        assert messages[3]["tool_name"] == "execute_code"
+        assert messages[2]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
 
 
