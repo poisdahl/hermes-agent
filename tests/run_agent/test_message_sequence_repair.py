@@ -57,6 +57,24 @@ def test_repair_merges_consecutive_user_messages():
     assert messages[0]["content"] == "first\n\nsecond"
 
 
+def test_repair_keeps_typed_timeline_marker_separate_from_real_user():
+    agent = _bare_agent()
+    messages = [
+        {
+            "role": "user",
+            "content": "[System: personality switched]",
+            "display_kind": "personality_switch",
+        },
+        {"role": "user", "content": "real question"},
+    ]
+    original = [dict(message) for message in messages]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 0
+    assert messages == original
+
+
 def test_repair_preserves_user_content_when_one_side_empty():
     agent = _bare_agent()
     messages = [
@@ -368,7 +386,6 @@ def test_sanitize_drops_empty_tool_calls_array():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
 
 
 

@@ -21,6 +21,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -646,6 +648,33 @@ def _shutdown_parallel_pool() -> None:
 
 
 atexit.register(_shutdown_parallel_pool)
+# Per-fire usage audit log for cron token spend instrumentation.
+# Resolves through _get_hermes_home() so profile-scoped paths work correctly.
+def _usage_audit_path() -> Path:
+    return _get_hermes_home() / "cron" / "usage_audit.jsonl"
+
+
+def _utcnow_iso_ms() -> str:
+    """RFC3339 UTC timestamp with millisecond precision and 'Z' suffix."""
+    now = datetime.now(timezone.utc)
+    # %f gives microseconds; trim to milliseconds.
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
+
+
+def _write_usage_audit(record: dict) -> None:
+    """Append a single JSONL line to ~/.hermes/cron/usage_audit.jsonl.
+
+    NEVER raises — a logger bug must not break cron jobs. Wraps the entire
+    write (path resolve, mkdir, json.dumps, file append) in a single try.
+    """
+    try:
+        path = _usage_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        logger.warning("usage_audit write failed: %s", e)
 
 
 def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
@@ -1149,8 +1178,35 @@ def _resolve_home_env_var(platform_name: str) -> str:
     return _plugin_cron_env_var(name)
 
 
-def _get_home_target_chat_id(platform_name: str) -> str:
-    """Return the configured home target chat/room ID for a delivery platform."""
+def _get_config_home_channel(platform_name: str):
+    """Return the persisted ``HomeChannel`` for a platform from gateway config.
+
+    ``/sethome`` declares ``config.yaml`` canonical (it is the only store that
+    survives for relay-fronted logical platforms, whose adapters are not
+    natively enabled) and mirrors the value into the legacy
+    ``<PLATFORM>_HOME_CHANNEL`` env var only as a best-effort compatibility
+    shim.  Cron historically read ONLY the env mirror, so a home channel that
+    existed solely in config.yaml — e.g. Discord fronted by the relay
+    connector, where no ``DISCORD_HOME_CHANNEL`` was ever exported — was
+    invisible and jobs silently fell back to local-only.  Reading the
+    canonical store here fixes that for every relay-fronted platform at once.
+    """
+    try:
+        from gateway.config import load_gateway_config, Platform
+
+        config = load_gateway_config()
+        platform = Platform(platform_name.lower())
+        return config.get_home_channel(platform)
+    except Exception:
+        logger.debug(
+            "config home_channel lookup failed for platform %r",
+            platform_name, exc_info=True,
+        )
+        return None
+
+
+def _env_home_target_chat_id(platform_name: str) -> str:
+    """Return the home chat id from the legacy env mirror only (no config)."""
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
@@ -1160,6 +1216,22 @@ def _get_home_target_chat_id(platform_name: str) -> str:
         if legacy:
             value = os.getenv(legacy, "")
     return value
+
+
+def _get_home_target_chat_id(platform_name: str) -> str:
+    """Return the configured home target chat/room ID for a delivery platform.
+
+    Resolution order: platform env var (legacy mirror, kept first so an
+    operator override keeps winning) → legacy env var name → the canonical
+    ``home_channel`` block persisted in config.yaml by ``/sethome``.
+    """
+    value = _env_home_target_chat_id(platform_name)
+    if value:
+        return value
+    home = _get_config_home_channel(platform_name)
+    if home is not None and home.chat_id:
+        return str(home.chat_id)
+    return ""
 
 
 def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
@@ -1174,18 +1246,26 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     without changing the lobby invariant.
     """
     env_var = _resolve_home_env_var(platform_name)
-    if not env_var:
-        return None
     if platform_name.lower() == "telegram":
         cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
-    if not value:
+    value = os.getenv(f"{env_var}_THREAD_ID", "").strip() if env_var else ""
+    if not value and env_var:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
             value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
-    return value or None
+    if value:
+        return value
+    # Canonical config.yaml fallback — same rationale as
+    # _get_home_target_chat_id, and thread affinity only applies when the
+    # chat itself resolved from the same config block (an env-provided chat
+    # id keeps its env-provided thread semantics).
+    if not _env_home_target_chat_id(platform_name):
+        home = _get_config_home_channel(platform_name)
+        if home is not None and home.thread_id:
+            return str(home.thread_id)
+    return None
 
 
 def _iter_home_target_platforms():
@@ -1712,7 +1792,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             pconfig = config.platforms.get(platform)
             runtime_adapter = None
 
-        if not pconfig or not pconfig.enabled:
+        if transport is not None and transport.is_relay:
+            # A relay transport carries the RELAY adapter's config, and
+            # resolve_delivery_transport already applied relay's enablement
+            # rule (config block absent OR enabled). The logical platform is
+            # deliberately NOT natively enabled in a relay-fronted deployment
+            # (its credential lives in the connector), so the native
+            # configured/enabled gate below must not apply — it used to
+            # reject exactly the targets the relay was resolved to serve.
+            if pconfig is None:
+                from gateway.config import PlatformConfig
+                pconfig = PlatformConfig(enabled=True)
+        elif not pconfig or not pconfig.enabled:
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
@@ -2201,7 +2292,11 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 continue
 
             if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+                # Include target context (platform/chat) so a bare error string
+                # like "Discord send failed: TimeoutError: " is attributable.
+                # Not inside an except block — the error comes from the send
+                # result dict, so there is no traceback to attach.
+                msg = f"delivery error: {result['error']} (target {platform_name}:{chat_id})"
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
@@ -2784,9 +2879,25 @@ def _build_job_prompt(
         )
         parts.insert(0, notice)
 
+    stable_prefix = None
     if prompt:
-        parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
-    return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+        from agent.skill_commands import append_user_instruction
+
+        parts.append("")
+        # The skill blocks (and any skipped-skill notice) above are stable per
+        # job config; the appended instruction carries the volatile per-run
+        # data (cron hint + prompt + script output + run context). Declare
+        # that boundary for the Anthropic cache planner (#81867).
+        stable_prefix = append_user_instruction(parts, prompt)
+    assembled = _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+    if stable_prefix and len(assembled) > len(stable_prefix) and assembled.startswith(stable_prefix):
+        # Guarded because the injection scanner may sanitize (mutate) the
+        # assembled bytes; a mismatch simply falls back to whole-message
+        # caching.
+        from agent.prompt_cache_boundary import register_stable_prefix
+
+        register_stable_prefix(stable_prefix)
+    return assembled
 
 
 def _scan_assembled_cron_prompt(
@@ -3162,6 +3273,22 @@ def run_job(
     #                               the whole point of no_agent is that there
     #                               is no agent to wake
     if job.get("no_agent"):
+        # Load .env before the script runs so auto-delivery can resolve home
+        # channels. A standalone cron tick process typically starts WITHOUT
+        # TELEGRAM_HOME_CHANNEL/DISCORD_HOME_CHANNEL in its environment, and
+        # the agent path's per-run dotenv reload below never executes for
+        # no_agent jobs — every deliver=telegram/all script job failed with
+        # "no delivery target resolved". load_hermes_dotenv does not override
+        # already-set vars, so the gateway's in-process tick is unaffected.
+        try:
+            from hermes_cli.env_loader import load_hermes_dotenv
+
+            load_hermes_dotenv(hermes_home=_get_hermes_home())
+        except Exception:
+            logger.debug(
+                "Job '%s': no_agent .env reload failed", job_id, exc_info=True
+            )
+
         script_path = job.get("script")
         if not script_path:
             err = "no_agent=True but no script is set for this job"
@@ -4042,6 +4169,7 @@ def run_job(
             skip_context_files=not bool(_job_workdir),
             load_soul_identity=True,
             skip_memory=True,  # Cron system prompts would corrupt user representations
+            skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
@@ -4095,6 +4223,9 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
+        # Tag this fire and time the run_conversation call for the usage_audit.jsonl entry.
+        _audit_fire_id = uuid.uuid4().hex
+        _audit_t_start = time.monotonic()
         _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
         _inactivity_timeout = False
         try:
@@ -4217,11 +4348,33 @@ def run_job(
         # and soft-failure marking below apply — restoring pre-#34452 silence
         # for scheduled jobs without disabling the explainer everywhere.
         if final_response.strip() and turn_exit_reason:
+            # The formatter's wording varies by persistence cause (locked /
+            # disk / unknown), so render every variant — matching only the
+            # one-argument render would let cause-refined explainer text slip
+            # through and be delivered as a cron warning.
+            _explainer_variants = []
             try:
-                _explainer_text = AIAgent._format_turn_completion_explanation(turn_exit_reason)
+                from hermes_state import PERSISTENCE_ERROR_CAUSES as _causes
             except Exception:
-                _explainer_text = ""
-            if _explainer_text and final_response.strip() == _explainer_text.strip():
+                _causes = ("locked", "disk", "unknown")
+            for _cause in (None, *_causes):
+                try:
+                    _variant = AIAgent._format_turn_completion_explanation(
+                        turn_exit_reason, _cause
+                    )
+                except TypeError:
+                    # Older single-argument formatter (or a test double).
+                    try:
+                        _variant = AIAgent._format_turn_completion_explanation(
+                            turn_exit_reason
+                        )
+                    except Exception:
+                        _variant = ""
+                except Exception:
+                    _variant = ""
+                if _variant:
+                    _explainer_variants.append(_variant.strip())
+            if final_response.strip() in _explainer_variants:
                 logger.info(
                     "Job '%s': abnormal empty turn (%s) — suppressing explainer for cron delivery",
                     job_id,
@@ -4248,11 +4401,46 @@ def run_job(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+
+        # Emit one JSONL line per fire for usage audit.
+        _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
+        _audit_response_silent = _is_cron_silence_response(final_response or "")
+        _write_usage_audit({
+            "ts": _utcnow_iso_ms(),
+            "job_id": job_id,
+            "fire_id": _audit_fire_id,
+            "prompt_tokens": result.get("prompt_tokens"),
+            "completion_tokens": result.get("completion_tokens"),
+            "total_tokens": result.get("total_tokens"),
+            "response_silent": _audit_response_silent,
+            "deliver_target": job.get("deliver"),
+            "model": model or None,
+            "duration_ms": _audit_duration_ms,
+            "error": None,
+        })
         return True, output, final_response, None
-        
+
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        # Best-effort audit write on failure path. _audit_fire_id
+        # may be unset if the exception fired before submit() — guard
+        # with a None check so the audit write itself never raises.
+        if "_audit_fire_id" in locals():
+            _audit_duration_ms = int((time.monotonic() - _audit_t_start) * 1000)
+            _write_usage_audit({
+                "ts": _utcnow_iso_ms(),
+                "job_id": job_id,
+                "fire_id": _audit_fire_id,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "total_tokens": None,
+                "response_silent": False,
+                "deliver_target": job.get("deliver"),
+                "model": model or None,
+                "duration_ms": _audit_duration_ms,
+                "error": error_msg,
+            })
         
         output = f"""# Cron Job: {job_name} (FAILED)
 

@@ -99,7 +99,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "read_preview", "read_window_below", "delegate_task"}
 )
 
 
@@ -739,6 +739,16 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
             and merged[-1].get("role") == "user"
         ):
             prev = merged[-1]
+            # Typed timeline rows (for example a personality switch) are
+            # durable UI/session events, not ordinary user-authored turns.
+            # Keep them separate from adjacent user messages so their
+            # display_kind cannot leak onto and hide a real user turn.
+            # Provider sanitizers merge copies later when wire-level role
+            # alternation requires it.
+            if prev.get("display_kind") or msg.get("display_kind"):
+                merged.append(msg)
+                continue
+
             # A summary carrier followed by a new user row is a deliberate
             # durable shape after retry/rewind.  Do not absorb the fresh ask
             # into the already-persisted carrier: mutating that dict can make
@@ -2195,6 +2205,27 @@ def anthropic_prompt_cache_policy(
         and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
     )
 
+    # MiniMax-M3 rides MiniMax's server-side automatic prefix cache on the
+    # Anthropic wire (content-keyed, no marker needed); explicit cache_control
+    # is documented for M2.7/M2.5/M2.1/M2 only, so markers on M3 are dead
+    # weight — never observable (cache_creation always 0) nor billable.
+    # Checked BEFORE the native-Anthropic return: provider="anthropic"
+    # pointed at a MiniMax /anthropic proxy is a supported override
+    # (_anthropic_base_url_override_ok) that would otherwise return
+    # (True, True) above this exclusion.
+    # Docs: https://platform.minimax.io/docs/api-reference/text-prompt-caching
+    is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
+    is_minimax_host = (
+        base_url_host_matches(eff_base_url, "api.minimax.io")
+        or base_url_host_matches(eff_base_url, "api.minimaxi.com")
+    )
+    is_minimax_route = is_minimax_provider or is_minimax_host
+    if is_anthropic_wire and is_minimax_route:
+        from agent.model_metadata import _model_name_suggests_minimax_m3
+
+        if _model_name_suggests_minimax_m3(eff_model):
+            return False, False
+
     if is_native_anthropic:
         return True, True
     # Envelope layout is an OpenAI-wire construct. Portal Claude on the native
@@ -2227,16 +2258,11 @@ def anthropic_prompt_cache_policy(
     # explicitly via provider id or host match so users on
     # provider=minimax / minimax-cn (or custom endpoints pointing at
     # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-    # same cost reduction as Claude traffic.
+    # same cost reduction as Claude traffic.  MiniMax-M3 never reaches
+    # here — it is excluded before the native-Anthropic return above.
     # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-    if is_anthropic_wire:
-        is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-        is_minimax_host = (
-            base_url_host_matches(eff_base_url, "api.minimax.io")
-            or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-        )
-        if is_minimax_provider or is_minimax_host:
-            return True, True
+    if is_anthropic_wire and is_minimax_route:
+        return True, True
 
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
     # transport that accepts Anthropic-style cache_control markers and
@@ -3011,6 +3037,15 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     start=next_args.get("start"),
                     count=next_args.get("count"),
                     callback=getattr(agent, "read_preview_callback", None),
+                ),
+                next_args,
+            )
+    elif function_name == "read_window_below":
+        def _execute(next_args: dict) -> Any:
+            from tools.read_window_tool import read_window_below_tool as _read_window_below_tool
+            return _finish_agent_tool(
+                _read_window_below_tool(
+                    callback=getattr(agent, "read_window_below_callback", None),
                 ),
                 next_args,
             )

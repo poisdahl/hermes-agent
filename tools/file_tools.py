@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """File Tools Module - LLM agent file manipulation tools."""
 
+import base64
 import errno
 import json
 import logging
@@ -1352,6 +1353,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _creation_locks,
         _creation_locks_lock,
         _resolve_container_task_id,
+        _resolve_task_host_cwd,
         _is_unusable_container_cwd,
         _CONTAINER_BACKENDS,
     )
@@ -1487,7 +1489,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 container_config=container_config,
                 local_config=local_config,
                 task_id=task_id,
-                host_cwd=config.get("host_cwd"),
+                host_cwd=_resolve_task_host_cwd(config, raw_task_id),
             )
 
             with _env_lock:
@@ -1513,6 +1515,38 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
+def _special_file_kind(path) -> str | None:
+    """Return a human name for non-regular file types that block reads.
+
+    Stat-based sibling of the name-based ``_is_blocked_device`` guard: a
+    FIFO at ``logs/live.pipe`` or a socket in a workspace hangs ``read_file``
+    just as hard as ``/dev/zero``, but carries no recognizable name. Only
+    called for host-visible filesystems (see ``_file_ops_uses_host_paths``);
+    remote backends cannot be statted from here.
+
+    Returns None for regular files, missing paths, and anything unstattable
+    (those flow to the normal read path and its own error handling).
+    """
+    import stat as _stat
+
+    try:
+        st = os.stat(os.fspath(path))  # follows symlinks, matching a real read
+    except OSError:
+        return None
+    mode = st.st_mode
+    if _stat.S_ISREG(mode) or _stat.S_ISDIR(mode):
+        return None
+    if _stat.S_ISFIFO(mode):
+        return "a FIFO (named pipe)"
+    if _stat.S_ISSOCK(mode):
+        return "a socket"
+    if _stat.S_ISCHR(mode):
+        return "a character device"
+    if _stat.S_ISBLK(mode):
+        return "a block device"
+    return "a special (non-regular) file"
+
+
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
     """Read a file with pagination and line numbers."""
     try:
@@ -1530,18 +1564,75 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         _resolved = _resolve_path_for_task(path, task_id)
 
+        # ── Special-file type guard (stat-based) ──────────────────────
+        # The name blocklist above catches /dev/* and /proc/* aliases; this
+        # catches the class — any FIFO/socket/device wherever it lives. A
+        # read on a FIFO blocks until the exec timeout: a self-shipped DoS.
+        if _file_ops_uses_host_paths(_get_file_ops(task_id)):
+            kind = _special_file_kind(_resolved)
+            if kind is not None:
+                return json.dumps({
+                    "success": False,
+                    "note": (
+                        f"'{path}' is {kind}, not a regular file — reading "
+                        "it would block indefinitely, so no read was "
+                        "attempted. Use terminal utilities if you need to "
+                        "interact with it."
+                    ),
+                })
+
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
         # Malformed documents fall through to the normal path/binary guard.
-        from tools.read_extract import ExtractionError, extract_document_text, is_extractable_document
+        from tools.read_extract import (
+            ANYDOC_EXTENSIONS,
+            EXTRACTABLE_EXTENSIONS,
+            MAX_DOCUMENT_BYTES,
+            ExtractionError,
+            extract_document_bytes,
+            is_extractable_document,
+        )
 
         if is_extractable_document(str(_resolved)):
+            file_ops = _get_file_ops(task_id)
             try:
-                extracted_text = extract_document_text(str(_resolved))
-            except ExtractionError:
+                binary = file_ops.read_file_bytes(
+                    str(_resolved), max_bytes=MAX_DOCUMENT_BYTES
+                )
+                if binary.error or binary.base64_content is None:
+                    raise ExtractionError(binary.error or "Document bytes unavailable")
+                document_bytes = base64.b64decode(
+                    binary.base64_content, validate=True
+                )
+                extracted_text = extract_document_bytes(
+                    document_bytes, str(_resolved)
+                )
+            except (ExtractionError, ValueError, base64.binascii.Error) as exc:
                 logger.debug("document extraction failed for %s", path, exc_info=True)
+                # For binary document formats, surface the specific failure
+                # (size cap, encrypted, malformed…) instead of falling through
+                # — the fallthrough path can only produce a generic
+                # binary-file error or garbage raw bytes, hiding the
+                # actionable reason (e.g. "Document too large to convert").
+                # .ipynb stays on the fallthrough path: it is plain JSON text
+                # and a raw read is genuinely useful.  Byte-transport issues
+                # (ValueError / binascii) keep the fallthrough too — only a
+                # specific ExtractionError carries an actionable reason.
+                _doc_ext = _resolved.suffix.lower()
+                _binary_doc = _doc_ext in ANYDOC_EXTENSIONS or (
+                    _doc_ext in EXTRACTABLE_EXTENSIONS and _doc_ext != ".ipynb"
+                )
+                if (
+                    _binary_doc
+                    and isinstance(exc, ExtractionError)
+                    and not str(exc).startswith("Unsupported document type")
+                ):
+                    return tool_error(
+                        f"Cannot read '{path}' ({_doc_ext}): document "
+                        f"extraction failed — {exc}. Use terminal utilities "
+                        "to inspect or convert the file."
+                    )
             else:
-                file_ops = _get_file_ops(task_id)
                 lines = extracted_text.splitlines()
                 total_lines = len(lines)
                 end_line = offset + limit - 1
@@ -1549,7 +1640,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 result_dict = {
                     "content": file_ops._add_line_numbers(page_text, offset) if page_text else "",
                     "total_lines": total_lines,
-                    "file_size": os.path.getsize(_resolved),
+                    "file_size": binary.file_size,
                     "truncated": total_lines > end_line,
                     "extracted_document": True,
                 }
@@ -1590,7 +1681,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 return json.dumps(result_dict, ensure_ascii=False)
 
         # ── Binary file guard ─────────────────────────────────────────
-        # Block binary files by extension (no I/O).
+        # Block binary files by extension (no I/O). Name what we know:
+        # the extension is a claim, so keep this branch's message to the
+        # extension itself — the content-sniffing path below names the
+        # actual magic-byte type for extension-less/lying files.
         if has_binary_extension(str(_resolved)):
             _ext = _resolved.suffix.lower()
             return tool_error(
@@ -2418,7 +2512,7 @@ def _check_file_reqs():
 
 READ_FILE_SCHEMA = {
     "name": "read_file",
-    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). NOTE: Cannot read images or other binary files — use vision_analyze for images.",
+    "description": "Read a text file with line numbers and pagination. Use this instead of cat/head/tail in terminal. Output format: 'LINE_NUM|CONTENT'. Suggests similar filenames if not found. Use offset and limit for large files. Reads exceeding ~100K characters are truncated on a line boundary and return a next_offset; continue with offset to read the rest. Jupyter notebooks (.ipynb), Word documents (.docx), and Excel workbooks (.xlsx) are auto-extracted to readable text; PDF, legacy Office (.doc/.ppt/.xls), OpenDocument, RTF, and EPUB convert too when the optional anydoc converter is available (auto-installed on first use where installs are permitted). PDF conversion reads the text layer only: scanned/image pages yield no text, and when many pages come back empty the output ends with an EXTRACTION COVERAGE WARNING listing the affected pages — follow its instructions (render pages with pdftoppm and inspect via vision_analyze, or OCR) instead of treating the extraction as complete. NOTE: Cannot read images or other binary files — use vision_analyze for images.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -2478,7 +2572,7 @@ PATCH_SCHEMA = {
             },
             "new_string": {
                 "type": "string",
-                "description": "REQUIRED when mode='replace'. Replacement text. Pass empty string '' to delete the matched text.",
+                "description": "REQUIRED when mode='replace'. Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
             },
             "replace_all": {
                 "type": "boolean",

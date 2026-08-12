@@ -724,6 +724,55 @@ DANGEROUS_PATTERNS = [
     # "del"/"rm" (e.g. `-File c:\del-logs\run.ps1`) is not.
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+(?:-(?:command|c)\s+)?["\']?(?:remove-item|rmdir|erase|del|rd|ri|rm)\b', "Windows PowerShell destructive delete"),
     (r'\b(?:powershell|pwsh)(?:\.exe)?\b.*\s-(?:encodedcommand|enc|e)\b', "PowerShell encoded command execution"),
+    # ── Windows destructive tier (#69472) ────────────────────────────────
+    # These are native Windows EXEs / cmdlets reachable from ANY Hermes
+    # terminal backend on a Windows host — including the default git-bash
+    # backend (taskkill.exe, icacls.exe, reg.exe, vssadmin.exe, bcdedit.exe,
+    # cipher.exe are ordinary PATH executables there). Detection input is
+    # lowercased by the variant loop, so patterns are written lowercase.
+    # Each pattern requires the destructive flag/verb so benign usage
+    # (`taskkill /IM app.exe` graceful kill, `reg query`, `icacls file`)
+    # does NOT prompt.
+    # Bare PowerShell destructive delete: Remove-Item/ri with -Recurse or
+    # -Force. The cmd/powershell-prefixed forms are covered above; this
+    # catches the bare form (ACP clients, pwsh-default SSH hosts, or
+    # `powershell` invoked earlier in a compound command).
+    (r'\bremove-item\b[^\n;|&]*\s-(?:recurse|force)\b', "PowerShell destructive delete (Remove-Item)"),
+    # cmd builtins with destructive switches, bare form: del/erase/rd/rmdir
+    # with /s (recurse) or /q (quiet). Requires the switch so `del file.txt`
+    # inside a cmd /c string stays covered by the prefixed rule only.
+    (r'\b(?:del|erase|rd|rmdir)\s+(?:/[a-z]\s+)*/[sq]\b', "Windows destructive delete (recursive/quiet switch)"),
+    # Remote content piped to Invoke-Expression — PowerShell's `curl | sh`.
+    (r'\b(?:iwr|invoke-webrequest|invoke-restmethod|irm|curl|wget)\b[^\n]*\|\s*(?:iex|invoke-expression)\b', "pipe remote content to PowerShell (iwr | iex)"),
+    (r'\b(?:iex|invoke-expression)\s*\(\s*(?:iwr|invoke-webrequest|invoke-restmethod|irm)\b', "execute remote content via Invoke-Expression"),
+    # Force process kills — Windows analogue of pkill -9.
+    (r'\btaskkill\b[^\n]*\s/f\b', "force kill processes (taskkill /F)"),
+    (r'\bstop-process\b[^\n]*\s-force\b', "force kill processes (Stop-Process -Force)"),
+    # Volume/disk destruction — Windows analogue of mkfs / dd.
+    (r'\bformat-volume\b', "format filesystem (Format-Volume)"),
+    (r'\bclear-disk\b', "wipe disk (Clear-Disk)"),
+    (r'\bdiskpart\b', "disk partitioning (diskpart)"),
+    (r'\bformat(?:\.com)?\s+[a-z]:', "format drive (format.com)"),
+    (r'\bcipher\s+/w\b', "wipe free space (cipher /w)"),
+    # ACL destruction — Windows analogue of chmod 777.
+    (r'\bicacls\b[^\n]*\s/grant\b[^\n]*\b(?:everyone|todos|jeder|tout\s+le\s+monde|\*s-1-1-0)\b', "grant Everyone access (icacls)"),
+    (r'\bicacls\b[^\n]*\s/reset\b', "reset ACLs recursively (icacls /reset)"),
+    # Backup/recovery destruction — classic ransomware prep, no benign
+    # agent use case.
+    (r'\bvssadmin\b[^\n]*\bdelete\s+shadows\b', "delete volume shadow copies (vssadmin)"),
+    (r'\bwbadmin\b[^\n]*\bdelete\b', "delete backups (wbadmin)"),
+    (r'\bbcdedit\b[^\n]*\s/set\b', "modify boot configuration (bcdedit /set)"),
+    # Registry deletion with force flag.
+    (r'\breg(?:\.exe)?\s+delete\b', "registry delete (reg delete)"),
+    (r'\bremove-itemproperty\b[^\n]*\s-force\b', "registry value delete (Remove-ItemProperty -Force)"),
+    # Windows service/system stop — analogue of systemctl stop.
+    (r'\bstop-service\b[^\n]*\s-force\b', "force stop service (Stop-Service -Force)"),
+    (r'\bsc(?:\.exe)?\s+(?:stop|delete)\b', "stop/delete service (sc)"),
+    # Credential/key paths in Windows form — the POSIX ~/.ssh patterns never
+    # match drive-letter or backslash spellings. Match both separators.
+    (r'\busers[\\/][^\\/\s]+[\\/]\.ssh\b', "access to SSH keys (Windows path)"),
+    (r'\bappdata[\\/](?:local|roaming)[\\/]hermes[^\n]*\.env\b', "access to Hermes secrets (Windows path)"),
+    # ─────────────────────────────────────────────────────────────────────
     (r'\bchmod\s+(-[^\s]*\s+)*(777|666|o\+[rwx]*w|a\+[rwx]*w)\b', "world/other-writable permissions"),
     (r'\bchmod\s+--recursive\b.*(777|666|o\+[rwx]*w|a\+[rwx]*w)', "recursive world/other-writable (long flag)"),
     (r'\bchown\s+(-[^\s]*)?R\s+root', "recursive chown to root"),
@@ -1900,74 +1949,70 @@ def _deobfuscate_shell_word_for_detection(word: str) -> str:
 
 def _iter_shell_command_starts(command: str):
     starts = [0]
-    quote: str | None = None
-    i = 0
-    while i < len(command):
-        ch = command[i]
-        if quote == "'":
-            if ch == "'":
-                quote = None
-            i += 1
-            continue
-        if quote == '"':
-            if ch == "\\" and i + 1 < len(command):
-                i += 2
-                continue
-            if ch == '"':
-                quote = None
+
+    def scan(start: int, end: int) -> None:
+        quote: str | None = None
+        i = start
+        while i < end:
+            ch = command[i]
+            if quote == "'":
+                if ch == "'":
+                    quote = None
                 i += 1
+                continue
+            if quote == '"':
+                if ch == "\\" and i + 1 < end:
+                    i += 2
+                    continue
+                if ch == '"':
+                    quote = None
+                    i += 1
+                    continue
+                if command.startswith("$(", i):
+                    nested_end = _scan_dollar_paren_end(command, i)
+                    starts.append(i + 2)
+                    scan(i + 2, nested_end - 1 if nested_end is not None else end)
+                    i = nested_end if nested_end is not None else end
+                    continue
+                if ch == "`":
+                    nested_end = _scan_backtick_end(command, i)
+                    starts.append(i + 1)
+                    scan(i + 1, nested_end - 1 if nested_end is not None else end)
+                    i = nested_end if nested_end is not None else end
+                    continue
+                i += 1
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+                i += 1
+                continue
+            if ch == "\\" and i + 1 < end:
+                i += 2
                 continue
             if command.startswith("$(", i):
+                nested_end = _scan_dollar_paren_end(command, i)
                 starts.append(i + 2)
-                i += 2
+                scan(i + 2, nested_end - 1 if nested_end is not None else end)
+                i = nested_end if nested_end is not None else end
                 continue
-            i += 1
-            continue
-        if ch in ("'", '"'):
-            quote = ch
-            i += 1
-            continue
-        if ch == "\\" and i + 1 < len(command):
-            i += 2
-            continue
-        if command.startswith("$(", i):
-            starts.append(i + 2)
-            i += 2
-            continue
-        # Bare subshell `(cmd)` and brace group `{ cmd; }` openers begin a new
-        # command context, just like `;` or `$(`. We only reach this branch
-        # OUTSIDE any quote (the quote arms above `continue` first), so a `(`
-        # or `{` sitting inside a quoted argument — `--title "block (reboot)"`,
-        # `echo "{ reboot; }"` — never registers a command start. That is the
-        # whole reason this lives in the quote-aware tokenizer instead of the
-        # flat `_CMDPOS` regex, which cannot tell quoted text from real syntax.
-        if ch in ("(", "{"):
-            starts.append(i + 1)
-            i += 1
-            continue
-        if ch == ";":
-            starts.append(i + 1)
-            i += 1
-            continue
-        if ch == "&":
-            if i + 1 < len(command) and command[i + 1] == "&":
-                starts.append(i + 2)
-                i += 2
-            else:
+            if ch == "`":
+                nested_end = _scan_backtick_end(command, i)
                 starts.append(i + 1)
-                i += 1
-            continue
-        if ch == "|":
-            if i + 1 < len(command) and command[i + 1] == "|":
-                starts.append(i + 2)
-                i += 2
-            else:
+                scan(i + 1, nested_end - 1 if nested_end is not None else end)
+                i = nested_end if nested_end is not None else end
+                continue
+            if ch in ("(", "{"):
                 starts.append(i + 1)
-                i += 1
-            continue
-        if ch == "\n":
-            starts.append(i + 1)
-        i += 1
+            elif ch in ";\n":
+                starts.append(i + 1)
+            elif ch in "&|":
+                repeated = i + 1 < end and command[i + 1] == ch
+                starts.append(i + 2 if repeated else i + 1)
+                if repeated:
+                    i += 1
+            i += 1
+
+    scan(0, len(command))
 
     seen: set[int] = set()
     for start in starts:
@@ -2108,6 +2153,22 @@ def _command_detection_variants(command: str):
     grep_safe, _ = _grep_safe_detection_variant(normalized)
     seen = {grep_safe}
     yield grep_safe
+    # Windows-path variant (#69472): normalization treats backslashes as
+    # shell escapes and strips them, so `del C:\Users\me\.ssh\id_rsa`
+    # reaches the patterns as `del C:Usersme.sshid_rsa` — no path rule can
+    # ever match a backslash Windows path. When the RAW command contains a
+    # drive-letter or UNC backslash path, also yield a variant with
+    # backslashes flattened to forward slashes BEFORE normalization eats
+    # them. Gated on a real path shape (letter, colon, backslash — or
+    # double backslash UNC) so POSIX escape semantics (`echo a\"b`) are
+    # untouched on every other command.
+    if re.search(r"(?:[A-Za-z]:|\\\\)[\\\\]", command) or re.search(r"[A-Za-z]:\\", command):
+        win_variant = _normalize_command_for_detection(
+            _mask_quoted_newlines(command.replace("\\", "/"))
+        )
+        if win_variant not in seen:
+            seen.add(win_variant)
+            yield win_variant
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.
