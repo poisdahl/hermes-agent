@@ -3005,6 +3005,12 @@ class BasePlatformAdapter(ABC):
         self._reaction_handler: Optional[
             Callable[[Dict[str, Any]], Awaitable[None]]
         ] = None
+        # Normalized platform events cross this runner-owned boundary before
+        # plugin dispatch so authorization/profile state never lives in an SDK
+        # adapter. The second argument is an internal SessionSource.
+        self._platform_event_handler: Optional[
+            Callable[[Dict[str, Any], Any], Awaitable[None]]
+        ] = None
         # Optional hook (e.g. Telegram DM topic recovery) that rewrites
         # ``event.source.thread_id`` before session keying. Returns the
         # corrected thread_id or None to leave the source untouched.
@@ -3582,7 +3588,7 @@ class BasePlatformAdapter(ABC):
     def is_connected(self) -> bool:
         """Check if adapter is currently connected."""
         return self._running
-    
+
     def set_message_handler(self, handler: MessageHandler) -> None:
         """
         Set the handler for incoming messages.
@@ -3591,6 +3597,19 @@ class BasePlatformAdapter(ABC):
         an optional response string.
         """
         self._message_handler = handler
+
+    def set_platform_event_handler(
+        self,
+        handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]],
+    ) -> None:
+        """Install the gateway-owned normalized platform-event boundary.
+
+        Adapters normalize SDK updates and pass only stable dictionaries plus an
+        internal ``SessionSource`` to this callback. The runner owns the final
+        authorization decision and plugin dispatch; an adapter with no callback
+        therefore fails closed instead of exposing pre-auth events.
+        """
+        self._platform_event_handler = handler
 
     def set_topic_recovery_fn(
         self,
