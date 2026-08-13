@@ -10,6 +10,8 @@ the already-completed work.
 
 from __future__ import annotations
 
+import pytest
+
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_HAS_USER_TURN_KEY,
     COMPRESSED_SUMMARY_METADATA_KEY,
@@ -248,14 +250,32 @@ class TestRetryableUserText:
         ) == "hello world"
 
     def test_rejects_media_parts_and_degraded_placeholders(self):
-        import pytest
-
         with pytest.raises(ValueError, match="media or unknown"):
             retryable_user_text(
                 [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}]
             )
         with pytest.raises(ValueError, match="cannot safely reconstruct"):
             retryable_user_text("please inspect [image|ybres:RID]")
+        with pytest.raises(ValueError, match="cannot safely reconstruct"):
+            retryable_user_text(
+                "[The user sent a voice message: /tmp/message.ogg]"
+            )
+        with pytest.raises(ValueError, match="cannot safely reconstruct"):
+            retryable_user_text(
+                "[image content removed — provider does not accept images]"
+            )
+        with pytest.raises(ValueError, match="cannot safely reconstruct"):
+            retryable_user_text("[User sent an image: /tmp/product.png]")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "Explain why ![alt](https://example.test/a.png) renders",
+            "Review @file:README.md and this data:image/png example",
+        ],
+    )
+    def test_keeps_ordinary_text_that_uses_media_like_syntax(self, text):
+        assert retryable_user_text(text) == text
 
 
 class TestCarrierAlternationRepair:

@@ -7474,16 +7474,16 @@ def history_before_user_originated_turn(
 
 _RETRY_MEDIA_PLACEHOLDER_RE = re.compile(
     r"(?:"
-    r"!\[[^\]]*\]\([^\n)]+\)"
-    r"|\[(?:screenshot|image|photo|picture|video|voice|audio|file|attachment|media)"
-    r"(?:\s*(?:\||:)[^\]]*|\s+(?:attached|omitted|removed)[^\]]*)?\]"
-    r"|\[(?:the\s+)?user\s+sent\s+(?:an?\s+)?"
-    r"(?:image|audio|video|voice(?:\s+message)?|file|(?:text\s+)?document)\b[^\]]*\]"
+    r"\[(?:screenshot|image|video|voice|图片|文件|视频|语音)\]"
+    r"|\[file(?::\s*[^\]|]+)?\]"
+    r"|\[(?:image|video|voice|file(?::[^\]|]+)?)\|ybres:[^\]]+\]"
+    r"|\[the\s+user\s+sent\s+(?:an\s+audio\s+file\s+attachment"
+    r"|a\s+video\s+attachment|an?\s+(?:text\s+)?document):[^\]]+\]"
+    r"|\[the\s+user\s+sent\s+an\s+image(?:~|\s+but\s+)[^\]]*\]"
+    r"|\[the\s+user\s+sent\s+a\s+voice\s+message(?::|\s+but\s+)[^\]]*\]"
+    r"|\[user\s+sent\s+(?:an\s+image|audio|a\s+video|a\s+file):[^\]]+\]"
     r"|\[voice\s+message\s+could\s+not\s+be\s+transcribed[^\]]*\]"
-    r"|\[image content removed[^\]]*\]"
-    r"|\[(?:图片|文件|视频|语音)\]"
-    r"|@(?:image|video|voice|audio|media|file):"
-    r"|data:(?:image|audio|video)/"
+    r"|\[image\s+content\s+removed[^\]]*\]"
     r"|\(the\s+user\s+sent\s+a\s+message\s+with\s+no\s+text\s+content\)"
     r")",
     re.IGNORECASE,

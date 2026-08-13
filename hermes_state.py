@@ -9358,115 +9358,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result["replacement_message_id"] = replacement_message_id
         return result
 
-    def restore_rewound(
-        self,
-        session_id: str,
-        since_message_id: int,
-        *,
-        replacement_message_id: Optional[int] = None,
-    ) -> int:
+    def restore_rewound(self, session_id: str, since_message_id: int) -> int:
         """Mark inactive messages with id >= *since_message_id* active again.
-
-        When undoing a rewind performed with
-        ``preserve_compaction_handoff=True``, pass the returned
-        ``replacement_message_id`` so the synthetic active handoff is archived
-        in the same transaction that restores the original composite carrier.
 
         Returns the number of rows flipped back to ``active=1``.
         Intended for undo-of-rewind and test cleanup; not wired to a
         slash command in v1.
         """
         def _do(conn):
-            if replacement_message_id is not None:
-                target = conn.execute(
-                    "SELECT * FROM messages WHERE id = ? AND session_id = ?",
-                    (since_message_id, session_id),
-                ).fetchone()
-                replacement = conn.execute(
-                    "SELECT * FROM messages "
-                    "WHERE id = ? AND session_id = ?",
-                    (replacement_message_id, session_id),
-                ).fetchone()
-
-                expected_handoff = None
-                expected_display_kind = None
-                expected_display_metadata = None
-                if (
-                    target is not None
-                    and target["role"] == "user"
-                    and not target["active"]
-                ):
-                    from agent.context_compressor import (
-                        split_user_originated_turn,
-                        summary_carrier_persistence_display,
-                    )
-
-                    target_message = dict(target)
-                    target_message["content"] = self._decode_content(
-                        target_message.get("content")
-                    )
-                    target_message["display_metadata"] = (
-                        self._decode_display_metadata(
-                            target_message.get("display_metadata")
-                        )
-                    )
-                    expected_handoff, live_view = split_user_originated_turn(
-                        target_message
-                    )
-                    if expected_handoff is not None and live_view is not None:
-                        (
-                            expected_display_kind,
-                            expected_display_metadata,
-                        ) = summary_carrier_persistence_display(expected_handoff)
-                    else:
-                        expected_handoff = None
-
-                def _matches_expected_handoff(row) -> bool:
-                    return bool(
-                        row is not None
-                        and expected_handoff is not None
-                        and row["role"] == expected_handoff.get("role")
-                        and row["active"]
-                        and self._decode_content(row["content"])
-                        == expected_handoff.get("content")
-                        and row["display_kind"] == expected_display_kind
-                        and self._decode_display_metadata(row["display_metadata"])
-                        == expected_display_metadata
-                        and row["timestamp"] == expected_handoff.get("timestamp")
-                    )
-
-                matching_replacements = [
-                    row["id"]
-                    for row in conn.execute(
-                        "SELECT * FROM messages WHERE session_id = ? "
-                        "AND id >= ? AND active = 1 AND role = 'user'",
-                        (session_id, since_message_id),
-                    ).fetchall()
-                    if _matches_expected_handoff(row)
-                ]
-                if (
-                    not _matches_expected_handoff(replacement)
-                    or matching_replacements != [replacement_message_id]
-                ):
-                    raise ValueError(
-                        "replacement_message_id must identify the active hidden "
-                        "handoff created by this rewind"
-                    )
-
-            # Resolve the archived originals before deactivating the synthetic
-            # replacement; otherwise its newer id would satisfy this query and
-            # be immediately reactivated with the original rows.
             cursor = conn.execute(
                 "SELECT id FROM messages "
                 "WHERE session_id = ? AND id >= ? AND active = 0",
                 (session_id, since_message_id),
             )
             ids = [r[0] for r in cursor.fetchall()]
-            if replacement_message_id is not None:
-                conn.execute(
-                    "UPDATE messages SET active = 0 WHERE id = ? AND session_id = ?",
-                    (replacement_message_id, session_id),
-                )
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 conn.execute(

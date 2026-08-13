@@ -868,9 +868,9 @@ def _(rid, params: dict) -> dict:
         if n < 1:
             n = 1
         from agent.context_compressor import (
-            retryable_user_text,
             user_originated_turn_view,
         )
+        from agent.message_content import flatten_message_text
 
         with session["history_lock"]:
             if session.get("running"):
@@ -891,13 +891,6 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4018, "no user messages to undo")
             turns_undone = min(n, len(user_indices))
             target_position = len(user_indices) - turns_undone
-            live_view = user_originated_turn_view(
-                history[user_indices[target_position]]
-            )
-            try:
-                target_text = retryable_user_text(live_view.get("content"))
-            except ValueError as exc:
-                return _err(rid, 4018, str(exc))
             try:
                 active, live_view, rewound_count = _rewind_active_session_history(
                     session, target_position
@@ -906,7 +899,7 @@ def _(rid, params: dict) -> dict:
                 return _err(rid, 4004, f"undo: {exc}")
             except Exception as exc:
                 return _err(rid, 5008, f"undo: {exc}")
-            target_text = retryable_user_text(live_view.get("content"))
+            target_text = flatten_message_text(live_view.get("content"))
         # Notify memory providers — same hook /branch fires, plus the
         # rewound flag so providers caching per-turn document state
         # know to invalidate. See #6672 + #21910.

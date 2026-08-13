@@ -337,6 +337,31 @@ def test_undo_targets_the_composite_carrier_not_an_older_user_turn(
     _assert_scaffold_preserved(db, session_key, session, prefix_len=2)
 
 
+def test_undo_rewinds_media_placeholder_without_treating_it_as_retry(
+    carrier_session,
+):
+    db, install = carrier_session
+    carrier = _composite_carrier()
+    carrier["content"] = carrier["content"].replace(
+        "REAL ASK", "look\n[screenshot]"
+    )
+    sid, session_key, session = install(
+        [carrier, {"role": "assistant", "content": "seen"}]
+    )
+
+    response = _dispatch(sid, "undo")
+
+    assert response["result"]["type"] == "prefill"
+    assert response["result"]["message"] == "look\n[screenshot]"
+    active = db.get_messages_as_conversation(session_key)
+    assert len(active) == 1
+    assert active[0]["display_kind"] == "hidden"
+    assert "look\n[screenshot]" not in active[0]["content"]
+    assert len(session["history"]) == 1
+    assert session["history"][0]["content"] == active[0]["content"]
+    assert session["history"][0]["display_kind"] == "hidden"
+
+
 def test_session_undo_preserves_the_composite_carriers_scaffold(carrier_session):
     db, install = carrier_session
     sid, session_key, session = install(
